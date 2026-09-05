@@ -475,11 +475,18 @@ video{max-width:100%;max-height:100%;display:block}
 .logbox.show{display:block}
 
 /* ── Full-width Timeline ── */
-.tl-section{flex-shrink:0;height:calc(90px + 10vh);background:#0a0f1a;border-top:1px solid var(--bd);position:relative;overflow:hidden}
+.tl-section{flex-shrink:0;height:calc(90px + 10vh);background:#0a0f1a;border-top:1px solid var(--bd);display:flex;flex-direction:column;padding-bottom:8px}
+.tl-cv-wrap{flex:1;position:relative;overflow:hidden;min-height:0}
 .tl-toolbar{position:absolute;top:3px;right:5px;z-index:3;display:flex;gap:3px}
 .tlb{padding:2px 7px;border-radius:4px;border:1px solid var(--bd);background:rgba(13,17,23,.88);color:var(--dim);font-size:10px;font-weight:600;cursor:pointer;transition:all .12s}
 .tlb:hover{border-color:var(--acc2);color:var(--acc2)}
 #tlCv{display:block;width:100%;height:100%;cursor:crosshair}
+#tlScrollBar{flex-shrink:0;height:10px;overflow-x:auto;overflow-y:hidden;margin:3px 10px 0;border-radius:4px}
+#tlScrollBar::-webkit-scrollbar{height:6px}
+#tlScrollBar::-webkit-scrollbar-track{background:rgba(255,255,255,.04);border-radius:3px}
+#tlScrollBar::-webkit-scrollbar-thumb{background:var(--bd);border-radius:3px;transition:background .15s}
+#tlScrollBar::-webkit-scrollbar-thumb:hover{background:var(--dim)}
+#tlScrollInner{height:1px;background:transparent}
 
 /* ── Modals ── */
 .mover{position:fixed;inset:0;background:rgba(0,0,0,.65);backdrop-filter:blur(4px);z-index:300;display:none;align-items:center;justify-content:center}
@@ -728,13 +735,16 @@ video{max-width:100%;max-height:100%;display:block}
 
 <!-- Timeline (full width) -->
 <div class="tl-section" id="tlSec" style="display:none">
-  <div class="tl-toolbar" style="display:flex;align-items:center;gap:5px">
-    <span class="tl-zoom-lbl">縮放</span>
-    <input type="range" id="tlZoomBar" min="0" max="100" value="0" oninput="tlZoomSlide(this.value)">
-    <span id="tlZoomPct">100%</span>
-    <button class="tlb" onclick="tlFit()">全覽</button>
+  <div class="tl-cv-wrap">
+    <div class="tl-toolbar" style="display:flex;align-items:center;gap:5px">
+      <span class="tl-zoom-lbl">縮放</span>
+      <input type="range" id="tlZoomBar" min="0" max="100" value="0" oninput="tlZoomSlide(this.value)">
+      <span id="tlZoomPct">100%</span>
+      <button class="tlb" onclick="tlFit()">全覽</button>
+    </div>
+    <canvas id="tlCv"></canvas>
   </div>
-  <canvas id="tlCv"></canvas>
+  <div id="tlScrollBar"><div id="tlScrollInner"></div></div>
 </div>
 
 <!-- Loading overlay -->
@@ -1276,15 +1286,28 @@ function tlX2T(x){return x/tlPPS+tlOff;}
 function tlClamp(){const mx=Math.max(0,(vid.duration||0)-tlCv.width/tlPPS);tlOff=Math.max(0,Math.min(tlOff,mx));}
 
 function initTL(){
-  const p=document.getElementById('tlSec');
-  tlCv.width=p.clientWidth||p.offsetWidth;
-  tlCv.height=p.clientHeight||p.offsetHeight;
+  const wrap=document.querySelector('.tl-cv-wrap');
+  tlCv.width=wrap.clientWidth||wrap.offsetWidth;
+  tlCv.height=wrap.clientHeight||wrap.offsetHeight;
   if(vid.duration){tlPPS=tlCv.width/vid.duration;tlOff=0;}
-  renderTL();tlSyncZoomBar();
-  // Auto-load waveform whenever a new video loads
+  renderTL();tlSyncZoomBar();tlUpdateScrollBar();
   if(videoId&&!wfPeaks) loadWf();
 }
 new ResizeObserver(()=>{if(tlVis)initTL();}).observe(document.getElementById('tlSec'));
+
+// ── Timeline scrollbar ────────────────────────────────────────────────────
+function tlUpdateScrollBar(){
+  const sb=document.getElementById('tlScrollBar'),si=document.getElementById('tlScrollInner');
+  if(!sb||!vid.duration)return;
+  si.style.width=Math.round(vid.duration*tlPPS)+'px';
+  sb._ignoreScroll=true;
+  sb.scrollLeft=Math.round(tlOff*tlPPS);
+  sb._ignoreScroll=false;
+}
+document.getElementById('tlScrollBar').addEventListener('scroll',function(){
+  if(this._ignoreScroll)return;
+  tlOff=this.scrollLeft/tlPPS;tlClamp();renderTL();
+});
 
 function tlTickInterval(vis){for(const t of[.5,1,2,5,10,15,30,60,120,300,600,1800,3600])if(t>=vis/10)return t;return 3600;}
 
@@ -1369,11 +1392,23 @@ function renderTL(){
     ctx.fillStyle='#f85149';
     ctx.beginPath();ctx.moveTo(px-5,0);ctx.lineTo(px+5,0);ctx.lineTo(px,9);ctx.fill();
   }
+
+  // Long-press ring indicator
+  if(tlLPTimer){
+    const prog=Math.min(1,(Date.now()-tlLPStart)/LP_MS);
+    const r=13,lx=tlLPX,ly=tlLPY;
+    ctx.save();
+    ctx.globalAlpha=.22;ctx.fillStyle='#fde047';
+    ctx.beginPath();ctx.arc(lx,ly,r,0,2*Math.PI);ctx.fill();
+    ctx.globalAlpha=1;ctx.strokeStyle='#fde047';ctx.lineWidth=2.5;
+    ctx.beginPath();ctx.arc(lx,ly,r,-Math.PI/2,-Math.PI/2+prog*2*Math.PI);ctx.stroke();
+    ctx.restore();
+  }
 }
 
 function tlStartLoop(){if(tlRAF)return;function L(){renderTL();tlRAF=requestAnimationFrame(L);}tlRAF=requestAnimationFrame(L);}
 function tlStopLoop(){if(tlRAF){cancelAnimationFrame(tlRAF);tlRAF=null;}}
-function tlFit(){if(vid.duration){tlPPS=tlCv.width/vid.duration;tlOff=0;renderTL();tlSyncZoomBar();}}
+function tlFit(){if(vid.duration){tlPPS=tlCv.width/vid.duration;tlOff=0;renderTL();tlSyncZoomBar();tlUpdateScrollBar();}}
 function tlSyncZoomBar(){
   const mn=vid.duration?tlCv.width/vid.duration:1,mx=600;
   const bar=document.getElementById('tlZoomBar'),pct=document.getElementById('tlZoomPct');
@@ -1388,9 +1423,23 @@ function tlZoomSlide(v){
   tlPPS=mn*Math.pow(mx/mn,v/100);
   tlOff=t-cx/tlPPS;tlClamp();renderTL();
   document.getElementById('tlZoomPct').textContent=Math.round(tlPPS/mn*100)+'%';
+  tlUpdateScrollBar();
 }
 
-const EDGE=7,RH_=20,SNAP_PX=10;
+const EDGE=7,RH_=20,SNAP_PX=10,LP_MS=500;
+let tlLPTimer=null,tlLPSX=0,tlLPSY=0,tlLPX=0,tlLPY=0,tlLPStart=0,tlLPRaf=null;
+
+function tlLPCancel(){
+  if(tlLPTimer){clearTimeout(tlLPTimer);tlLPTimer=null;}
+  if(tlLPRaf){cancelAnimationFrame(tlLPRaf);tlLPRaf=null;}
+  renderTL();
+}
+function tlLPTick(){
+  if(!tlLPTimer){tlLPRaf=null;return;}
+  renderTL();
+  tlLPRaf=requestAnimationFrame(tlLPTick);
+}
+
 function snapTime(t,excludeIdx){
   let best=t,bestPixDist=SNAP_PX;
   subs.forEach((s,i)=>{
@@ -1420,10 +1469,35 @@ tlCv.addEventListener('mousedown',e=>{
     document.getElementById(`row-${i}`)?.scrollIntoView({block:'nearest'});
     renderTL();return;
   }
+  // Empty space: seek + start long-press timer to add subtitle
   vid.currentTime=Math.max(0,Math.min(tlX2T(x),vid.duration||0));renderTL();
+  if(y>=BT&&y<=BT+BH){
+    tlLPSX=e.clientX;tlLPSY=e.clientY;tlLPX=x;tlLPY=y;tlLPStart=Date.now();
+    tlLPTimer=setTimeout(()=>{
+      tlLPTimer=null;
+      if(tlLPRaf){cancelAnimationFrame(tlLPRaf);tlLPRaf=null;}
+      if(!vid.duration)return;
+      const t=Math.max(0,Math.min(tlX2T(tlLPX),vid.duration));
+      push();
+      const ns={start:t,end:Math.min(t+2,vid.duration),text:''};
+      subs.push(ns);subs.sort((a,b)=>a.start-b.start);
+      const idx=subs.indexOf(ns);activeIdx=idx;
+      renderList();renderTL();tlUpdateScrollBar();
+      setTimeout(()=>{
+        document.getElementById(`row-${idx}`)?.scrollIntoView({block:'nearest',behavior:'smooth'});
+        const tx=document.getElementById(`tx-${idx}`);if(tx){tx.focus();tx.select();}
+      },50);
+    },LP_MS);
+    if(!tlLPRaf)tlLPRaf=requestAnimationFrame(tlLPTick);
+  }
 });
 document.addEventListener('mousemove',e=>{
-  if(tlPan){const dx=e.clientX-tlPan.sx;tlOff=tlPan.so-dx/tlPPS;tlClamp();renderTL();return;}
+  // Cancel long-press if mouse moved more than 5px
+  if(tlLPTimer){
+    const dx=e.clientX-tlLPSX,dy=e.clientY-tlLPSY;
+    if(dx*dx+dy*dy>25){tlLPCancel();}
+  }
+  if(tlPan){const dx=e.clientX-tlPan.sx;tlOff=tlPan.so-dx/tlPPS;tlClamp();renderTL();tlUpdateScrollBar();return;}
   if(ovDrag){
     const vw=document.getElementById('vWrap'),rect=vw.getBoundingClientRect();
     const rawX=Math.max(3,Math.min(97,ovDragX0+(e.clientX-ovDragSX)/rect.width*100));
@@ -1447,10 +1521,12 @@ document.addEventListener('mousemove',e=>{
   renderTL();
 });
 document.addEventListener('mouseup',()=>{
+  if(tlLPTimer)tlLPCancel();
   const wasDragging=ovDrag;
   tlDrag=null;tlPan=null;ovDrag=false;
   if(wasDragging)_hideGuides();
   if(snapIndicator!==null){snapIndicator=null;renderTL();}
+  tlUpdateScrollBar();
 });
 
 tlCv.addEventListener('mousemove',e=>{
@@ -1463,6 +1539,8 @@ tlCv.addEventListener('mousemove',e=>{
       const x1=tlT2X(subs[i].start),x2=tlT2X(subs[i].end);
       if(x>=x1-EDGE&&x<=x2+EDGE){tlCv.style.cursor=(x<=x1+EDGE||x>=x2-EDGE)?'ew-resize':'grab';return;}
     }
+    tlCv.style.cursor='cell'; // hint: can long-press to add subtitle
+    return;
   }
   tlCv.style.cursor='crosshair';
 });
@@ -1492,7 +1570,7 @@ tlCv.addEventListener('wheel',e=>{
   const rc=tlCv.getBoundingClientRect(),x=(e.clientX-rc.left)*(tlCv.width/rc.width),t=tlX2T(x);
   const mn=vid.duration?tlCv.width/vid.duration:.1;
   tlPPS=Math.max(mn,Math.min(600,tlPPS*(e.deltaY<0?1.25:.8)));
-  tlOff=t-x/tlPPS;tlClamp();renderTL();tlSyncZoomBar();
+  tlOff=t-x/tlPPS;tlClamp();renderTL();tlSyncZoomBar();tlUpdateScrollBar();
 },{passive:false});
 
 // ── Init ──────────────────────────────────────────────────────────────────
