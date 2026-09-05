@@ -1,0 +1,27 @@
+#!/bin/bash
+# SubtitleEditor.app — macOS 應用程式啟動器
+# 雙擊即可直接在瀏覽器開啟字幕編輯器。
+# 目錄結構：
+#   whisper_subtitle/
+#     SubtitleEditor.app/Contents/MacOS/launcher  ← 此檔案
+#     web_editor.py
+#     venv/
+
+MACOS_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(cd "$MACOS_DIR/../../.." && pwd)"
+
+PYTHON="$PROJECT_DIR/venv/bin/python"
+WEB_PY="$PROJECT_DIR/web_editor.py"
+
+if [ ! -f "$PYTHON" ]; then
+    osascript << 'EOF'
+tell application "System Events"
+    display dialog "❌ 尚未安裝依賴\n\n請先在終端機執行：\n\n  cd ~/whisper_subtitle\n  bash install.sh" ¬
+        buttons {"確定"} default button 1 with icon stop ¬
+        with title "SubtitleEditor — 安裝提示"
+end tell
+EOF
+    exit 1
+fi
+
+exec "$PYTHON" "$WEB_PY"

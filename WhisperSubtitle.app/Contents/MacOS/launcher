@@ -1,0 +1,32 @@
+#!/bin/bash
+# ──────────────────────────────────────────────────────────────────────────────
+# WhisperSubtitle.app — macOS 應用程式啟動器
+# 雙擊即可直接啟動，不會開啟任何終端機視窗。
+# 目錄結構：
+#   whisper_subtitle/
+#     WhisperSubtitle.app/Contents/MacOS/launcher  ← 此檔案
+#     app.py
+#     venv/
+# ──────────────────────────────────────────────────────────────────────────────
+
+# 計算專案根目錄（從 MacOS/ 往上三層）
+MACOS_DIR="$(cd "$(dirname "$0")" && pwd)"          # …/MacOS
+PROJECT_DIR="$(cd "$MACOS_DIR/../../.." && pwd)"    # …/whisper_subtitle
+
+PYTHON="$PROJECT_DIR/venv/bin/python"
+APP_PY="$PROJECT_DIR/app.py"
+
+# ── 依賴檢查（尚未安裝時顯示圖形對話框）──────────────────────────────────────
+if [ ! -f "$PYTHON" ]; then
+    osascript << 'EOF'
+tell application "System Events"
+    display dialog "❌ 尚未安裝依賴\n\n請先在終端機執行：\n\n  cd ~/whisper_subtitle\n  bash install.sh" ¬
+        buttons {"確定"} default button 1 with icon stop ¬
+        with title "WhisperSubtitle — 安裝提示"
+end tell
+EOF
+    exit 1
+fi
+
+# ── 啟動主程式（exec 取代 shell 程序，不留殘留程序）────────────────────────────
+exec "$PYTHON" "$APP_PY"
