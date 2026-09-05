@@ -300,6 +300,21 @@ def api_burn_job(bid):
     if not j: return jsonify({"status":"not_found"}),404
     return jsonify({"status":j["status"],"progress":j["progress"],"error":j["error"]})
 
+@app.route("/api/extract_audio/<vid_id>")
+def api_extract_audio(vid_id):
+    matches=list(UPLOAD_DIR.glob(f"{vid_id}.*"))
+    if not matches: return jsonify({"error":"not found"}),404
+    vpath=str(matches[0])
+    aud_path=str(UPLOAD_DIR/f"{vid_id}_wf.wav")
+    if not Path(aud_path).exists():
+        r=subprocess.run(
+            ["ffmpeg","-y","-i",vpath,"-vn","-acodec","pcm_s16le",
+             "-ar","16000","-ac","1",aud_path],
+            capture_output=True,timeout=180)
+        if r.returncode!=0:
+            return jsonify({"error":"ffmpeg audio extract failed"}),500
+    return send_file(aud_path,mimetype="audio/wav")
+
 @app.route("/api/burn_job/<bid>/cancel",methods=["POST"])
 def api_burn_cancel(bid):
     if bid in BURN_JOBS: BURN_JOBS[bid]["cancel"]=True
@@ -460,7 +475,7 @@ video{max-width:100%;max-height:100%;display:block}
 .logbox.show{display:block}
 
 /* ── Full-width Timeline ── */
-.tl-section{flex-shrink:0;height:90px;background:#0a0f1a;border-top:1px solid var(--bd);position:relative;overflow:hidden}
+.tl-section{flex-shrink:0;height:calc(90px + 10vh);background:#0a0f1a;border-top:1px solid var(--bd);position:relative;overflow:hidden}
 .tl-toolbar{position:absolute;top:3px;right:5px;z-index:3;display:flex;gap:3px}
 .tlb{padding:2px 7px;border-radius:4px;border:1px solid var(--bd);background:rgba(13,17,23,.88);color:var(--dim);font-size:10px;font-weight:600;cursor:pointer;transition:all .12s}
 .tlb:hover{border-color:var(--acc2);color:var(--acc2)}
@@ -718,7 +733,6 @@ video{max-width:100%;max-height:100%;display:block}
     <input type="range" id="tlZoomBar" min="0" max="100" value="0" oninput="tlZoomSlide(this.value)">
     <span id="tlZoomPct">100%</span>
     <button class="tlb" onclick="tlFit()">全覽</button>
-    <button class="tlb" id="btnWf" onclick="loadWf()">📊 波形</button>
   </div>
   <canvas id="tlCv"></canvas>
 </div>
@@ -1085,8 +1099,6 @@ function loadVid(url){
   document.getElementById('vcArea').style.display='block';
   document.getElementById('tlSec').style.display='block';
   tlVis=true;wfPeaks=null;
-  document.getElementById('btnWf').textContent='📊 波形';
-  document.getElementById('btnWf').disabled=false;
   vid.load();
 }
 
@@ -1269,6 +1281,8 @@ function initTL(){
   tlCv.height=p.clientHeight||p.offsetHeight;
   if(vid.duration){tlPPS=tlCv.width/vid.duration;tlOff=0;}
   renderTL();tlSyncZoomBar();
+  // Auto-load waveform whenever a new video loads
+  if(videoId&&!wfPeaks) loadWf();
 }
 new ResizeObserver(()=>{if(tlVis)initTL();}).observe(document.getElementById('tlSec'));
 
@@ -1455,19 +1469,21 @@ tlCv.addEventListener('mousemove',e=>{
 
 // ── Waveform ──────────────────────────────────────────────────────────────
 async function loadWf(){
-  if(!vid.src)return;
-  const btn=document.getElementById('btnWf');
-  btn.textContent='⏳ 載入…';btn.disabled=true;
+  if(!videoId)return;
   try{
+    const r=await fetch(`/api/extract_audio/${videoId}`);
+    if(!r.ok)throw new Error(`server ${r.status}`);
     const ac=new(window.AudioContext||window.webkitAudioContext)();
-    const decoded=await ac.decodeAudioData(await(await fetch(vid.src)).arrayBuffer());
+    const decoded=await ac.decodeAudioData(await r.arrayBuffer());
     ac.close();
-    const data=decoded.getChannelData(0),N=Math.min(tlCv.width*4,10000),block=Math.floor(data.length/N);
+    const data=decoded.getChannelData(0),N=Math.min(tlCv.width*4,10000),block=Math.max(1,Math.floor(data.length/N));
     const peaks=new Float32Array(N);let mx=0;
     for(let i=0;i<N;i++){let s=0;for(let j=0;j<block;j++)s+=Math.abs(data[i*block+j]||0);peaks[i]=s/block;if(peaks[i]>mx)mx=peaks[i];}
     if(mx>0)for(let i=0;i<N;i++)peaks[i]/=mx;
-    wfPeaks=peaks;btn.textContent='✅ 波形';renderTL();
-  }catch(e){btn.textContent='📊 波形';btn.disabled=false;alert('無法載入波形：'+e.message);}
+    wfPeaks=peaks;renderTL();
+  }catch(e){
+    console.warn('波形載入失敗:',e.message);
+  }
 }
 
 // ── Wheel zoom sync ───────────────────────────────────────────────────────
