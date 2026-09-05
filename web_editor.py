@@ -315,6 +315,35 @@ def api_extract_audio(vid_id):
             return jsonify({"error":"ffmpeg audio extract failed"}),500
     return send_file(aud_path,mimetype="audio/wav")
 
+@app.route("/api/auto_align/<vid_id>",methods=["POST"])
+def api_auto_align(vid_id):
+    """Detect when speech actually starts using ffmpeg silencedetect,
+       so the frontend can calculate a timing offset vs Whisper output."""
+    aud_path=UPLOAD_DIR/f"{vid_id}_wf.wav"
+    matches=list(UPLOAD_DIR.glob(f"{vid_id}.*"))
+    if not matches: return jsonify({"error":"not found"}),404
+    # Use pre-extracted WAV if available, else the source video
+    target=str(aud_path) if aud_path.exists() else str(matches[0])
+    try:
+        r=subprocess.run(
+            ["ffmpeg","-i",target,
+             "-af","silencedetect=noise=-35dB:d=0.25",
+             "-f","null","-"],
+            capture_output=True,text=True,timeout=120)
+        # silence_end = moment silence ends = speech begins
+        speech_start=None
+        for line in r.stderr.split("\n"):
+            m=re.search(r"silence_end:\s*([\d.]+)",line)
+            if m:
+                speech_start=float(m.group(1))
+                break  # first occurrence = first speech onset
+        # If no leading silence found, speech starts from the very beginning
+        if speech_start is None:
+            speech_start=0.0
+        return jsonify({"speech_start":round(speech_start,3)})
+    except Exception as e:
+        return jsonify({"error":str(e)}),500
+
 @app.route("/api/burn_job/<bid>/cancel",methods=["POST"])
 def api_burn_cancel(bid):
     if bid in BURN_JOBS: BURN_JOBS[bid]["cancel"]=True
@@ -516,6 +545,10 @@ video{max-width:100%;max-height:100%;display:block}
 /* Shift */
 .shift-inp{width:100%;margin-top:8px;font-size:15px;text-align:center;padding:8px;border-radius:7px;background:var(--p3);border:1px solid var(--bd);color:var(--txt);outline:none}
 .shift-inp:focus{border-color:var(--acc)}
+/* Toast notification */
+.toast{position:fixed;bottom:90px;left:50%;transform:translateX(-50%);background:var(--p1);border:1px solid var(--bd);color:var(--txt);padding:9px 20px;border-radius:10px;font-size:13px;font-weight:600;z-index:500;pointer-events:none;box-shadow:0 4px 16px rgba(0,0,0,.5);display:flex;align-items:center;gap:8px;white-space:nowrap}
+.toast.good{border-color:var(--grn);color:var(--grn)}
+.toast.warn{border-color:var(--yel);color:var(--yel)}
 /* Loading overlay */
 #loadOv{position:fixed;inset:0;background:rgba(0,0,0,.85);backdrop-filter:blur(8px);z-index:1000;display:none;flex-direction:column;align-items:center;justify-content:center;gap:16px}
 #loadOv.on{display:flex}
@@ -551,6 +584,7 @@ video{max-width:100%;max-height:100%;display:block}
   <div class="sep"></div>
   <button class="hbtn" onclick="openSearch()" title="Ctrl+F">🔍 搜尋</button>
   <button class="hbtn" onclick="openShift()">⏱ 偏移</button>
+  <button class="hbtn" id="btnAlign" onclick="runAutoAlign(true)" title="偵測語音起點並自動校正時間戳">🎯 校時</button>
   <button class="hbtn" id="btnStyleToggle" onclick="toggleStyle()">✏️ 字幕樣式</button>
   <div class="sep"></div>
   <button class="hbtn" id="btnU" onclick="undo()" disabled>⎌ 復原</button>
@@ -1171,6 +1205,52 @@ function replAll(){
   renderList();closeSearch();alert(`已取代 ${cnt} 個字幕`);
 }
 
+// ── Auto timing alignment ─────────────────────────────────────────────────
+function showToast(msg,type,duration){
+  const t=document.createElement('div');
+  t.className='toast'+(type?' '+type:'');
+  t.textContent=msg;
+  document.body.appendChild(t);
+  t.animate([{opacity:0,transform:'translate(-50%,8px)'},{opacity:1,transform:'translate(-50%,0)'}],{duration:200,fill:'forwards'});
+  setTimeout(()=>{
+    t.animate([{opacity:1},{opacity:0}],{duration:300,fill:'forwards'});
+    setTimeout(()=>t.remove(),300);
+  },duration||3000);
+}
+
+async function runAutoAlign(manual){
+  if(!videoId){if(manual)showToast('請先上傳影片','warn');return;}
+  if(!subs.length){if(manual)showToast('尚無字幕可校時','warn');return;}
+  const btn=document.getElementById('btnAlign');
+  if(btn){btn.disabled=true;btn.textContent='🎯 偵測中…';}
+  try{
+    const r=await fetch(`/api/auto_align/${videoId}`,{method:'POST'});
+    const d=await r.json();
+    if(d.error){if(manual)showToast('校時失敗：'+d.error,'warn');return;}
+    const speechStart=d.speech_start;
+    const subsStart=subs[0].start;
+    const offset=speechStart-subsStart;
+    if(Math.abs(offset)<0.15){
+      if(manual)showToast(`時間戳已對齊（偏差 ${Math.round(offset*1000)}ms，無需校正）`,'good');
+      return;
+    }
+    // Apply correction
+    push();
+    subs=subs.map(s=>({...s,
+      start:Math.max(0,parseFloat((s.start+offset).toFixed(3))),
+      end:Math.max(0,parseFloat((s.end+offset).toFixed(3)))
+    }));
+    renderList();renderTL();
+    const sign=offset>0?'+':'';
+    showToast(`已自動校時 ${sign}${Math.round(offset*1000)}ms（語音起點 ${speechStart.toFixed(2)}s）`,'good',4000);
+  }catch(e){
+    if(manual)showToast('校時請求失敗','warn');
+    console.warn('autoAlign error:',e);
+  }finally{
+    if(btn){btn.disabled=false;btn.textContent='🎯 校時';}
+  }
+}
+
 // ── Export ────────────────────────────────────────────────────────────────
 function toggleExp(){const m=document.getElementById('expMenu');m.classList.toggle('open');if(m.classList.contains('open'))document.addEventListener('click',expOuter,true);}
 function closeExp(){document.getElementById('expMenu').classList.remove('open');document.removeEventListener('click',expOuter,true);}
@@ -1269,7 +1349,10 @@ function pollTx(){
       d.status==='running'?`轉錄中… ${p}%`:d.status==='done'?`✅ 完成 ${(d.segments||[]).length} 段`:
       d.status==='cancelled'?'⚠️ 已取消':`❌ ${d.error||d.status}`;
     if(d.log?.length){document.getElementById('logBox').textContent=d.log.join('\n');document.getElementById('logBox').scrollTop=9999;}
-    if(d.status==='done'&&d.segments){push();subs=d.segments;renderList();renderTL();txDone('done');}
+    if(d.status==='done'&&d.segments){push();subs=d.segments;renderList();renderTL();txDone('done');
+      // Auto-align timing after transcription (non-blocking, silent if <150ms off)
+      setTimeout(()=>runAutoAlign(false),800);
+    }
     else if(d.status==='error'||d.status==='cancelled')txDone(d.status);
     else pollTmr=setTimeout(pollTx,1000);
   }).catch(()=>{pollTmr=setTimeout(pollTx,2000);});
