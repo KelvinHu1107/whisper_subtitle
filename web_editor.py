@@ -4,10 +4,10 @@
 字幕編輯器 - Web 版本 v3.0
 啟動：./venv/bin/python web_editor.py  →  http://localhost:5500
 """
-import sys, os, re, uuid, threading, subprocess, tempfile, traceback
+import sys, os, re, uuid, threading, subprocess, tempfile, traceback, json
 from pathlib import Path
 
-for _d in ("/opt/homebrew/bin", "/usr/local/bin"):
+for _d in ("/opt/homebrew/opt/ffmpeg-full/bin", "/opt/homebrew/bin", "/usr/local/bin"):
     if os.path.isdir(_d) and _d not in os.environ.get("PATH",""):
         os.environ["PATH"] = _d + ":" + os.environ.get("PATH","")
 
@@ -154,6 +154,20 @@ def _transcribe_worker(jid,vpath,model,quality,prompt,to_tc,delay_ms):
 
 # ── Burn subtitles into video ─────────────────────────────────────────────
 BURN_JOBS: dict={}
+VIDEO_NAMES: dict={}
+
+_MP4_SAFE_AUDIO = {"aac","mp3","ac3","eac3","alac","flac","opus","mp2"}
+
+def _probe_audio_codec(vpath):
+    try:
+        r=subprocess.run(
+            ["ffprobe","-v","error","-select_streams","a:0",
+             "-show_entries","stream=codec_name",
+             "-of","default=noprint_wrappers=1:nokey=1",vpath],
+            capture_output=True,text=True,timeout=30)
+        return r.stdout.strip().lower()
+    except Exception:
+        return ""
 
 def _hex_to_ass(hex_color,alpha=1.0):
     h=hex_color.lstrip("#")
@@ -183,10 +197,11 @@ def _build_ass(segments,style):
     pos_tag = f"{{\\an5\\pos({px},{py})}}"
     align   = 5   # center-center
     marginv = 0
+    stroke_w = int(style.get("strokeWidth", 3))
     if bgst=="none":
         bs,outline,shadow,bcol=1,0,0,"&H00000000"
     elif bgst=="outline":
-        bs,outline,shadow,bcol=1,2,1,_hex_to_ass(bgcol,bgopa)
+        bs,outline,shadow,bcol=1,stroke_w,1,_hex_to_ass(bgcol,bgopa)
     elif bgst=="solid":
         bs,outline,shadow,bcol=3,0,0,_hex_to_ass(bgcol,1.0)
     else:  # box
@@ -212,18 +227,25 @@ def _burn_worker(bid,vpath,ass_path,out_path,crf):
     try:
         job["status"]="running"; job["progress"]=5
         dur=get_duration(vpath)
+        acodec=_probe_audio_codec(vpath)
+        a_opts=["-c:a","copy"] if acodec in _MP4_SAFE_AUDIO else ["-c:a","aac","-b:a","256k"]
         cmd=["ffmpeg","-y","-i",vpath,"-vf",f"ass={ass_path}",
-             "-c:v","libx264","-crf",str(crf),"-preset","fast","-c:a","copy",out_path]
+             "-c:v","libx264","-crf",str(crf),"-preset","fast","-pix_fmt","yuv420p",
+             *a_opts,out_path]
         proc=subprocess.Popen(cmd,stderr=subprocess.PIPE,stdout=subprocess.DEVNULL,universal_newlines=True)
         tre=re.compile(r"time=(\d+):(\d+):(\d+\.\d+)")
+        err_lines=[]
         for line in proc.stderr:
             if job.get("cancel"): proc.kill(); job["status"]="cancelled"; return
+            err_lines.append(line.rstrip())
             m=tre.search(line)
             if m and dur>0:
                 t=float(m.group(1))*3600+float(m.group(2))*60+float(m.group(3))
                 job["progress"]=min(95,int(t/dur*100))
         proc.wait()
-        if proc.returncode!=0: job["status"]="error"; job["error"]="ffmpeg 執行失敗（請確認已安裝 ffmpeg）"
+        if proc.returncode!=0:
+            detail=next((l for l in reversed(err_lines) if any(k in l for k in ('Error','error','Invalid','No such','Unknown','not found','Unrecognized'))),'')
+            job["status"]="error"; job["error"]=f"ffmpeg 失敗（code {proc.returncode}）{': '+detail if detail else ''}"
         else: job["progress"]=100; job["status"]="done"; job["out"]=out_path
     except Exception as e: job["status"]="error"; job["error"]=str(e)
 
@@ -245,6 +267,7 @@ def api_upload():
     vid_id=str(uuid.uuid4())
     path=UPLOAD_DIR/f"{vid_id}{Path(f.filename).suffix.lower()}"
     f.save(path)
+    VIDEO_NAMES[vid_id]=Path(f.filename).stem
     return jsonify({"video_id":vid_id,"url":f"/uploads/{path.name}"})
 
 @app.route("/uploads/<fn>")
@@ -289,7 +312,8 @@ def api_burn_start():
     ass_path=str(UPLOAD_DIR/f"{bid}.ass")
     out_path=str(UPLOAD_DIR/f"{bid}_out.mp4")
     with open(ass_path,"w",encoding="utf-8") as f: f.write(_build_ass(d.get("segments",[]),d.get("style",{})))
-    BURN_JOBS[bid]={"status":"pending","progress":0,"out":None,"error":None,"cancel":False}
+    orig_name=VIDEO_NAMES.get(d.get('video_id',''),'subtitled')
+    BURN_JOBS[bid]={"status":"pending","progress":0,"out":None,"error":None,"cancel":False,"orig_name":orig_name}
     threading.Thread(target=_burn_worker,daemon=True,
         args=(bid,str(matches[0]),ass_path,out_path,int(d.get("crf",18)))).start()
     return jsonify({"burn_id":bid})
@@ -353,7 +377,45 @@ def api_burn_cancel(bid):
 def api_burn_download(bid):
     j=BURN_JOBS.get(bid)
     if not j or j["status"]!="done" or not j.get("out"): return jsonify({"error":"not ready"}),404
-    return send_file(j["out"],as_attachment=True,download_name="subtitled_video.mp4",mimetype="video/mp4")
+    orig=j.get("orig_name","subtitled")
+    return send_file(j["out"],as_attachment=True,download_name=f"{orig}-有字幕版.mp4",mimetype="video/mp4")
+
+# ── Session persistence ───────────────────────────────────────────────────
+SESSION_FILE = Path(__file__).parent / ".subtitle_session.json"
+
+@app.route("/api/session/save", methods=["POST"])
+def api_session_save():
+    try: d=request.get_json(force=True) or {}
+    except: d={}
+    vid_id=d.get("video_id")
+    if vid_id and vid_id in VIDEO_NAMES:
+        d["video_name"]=VIDEO_NAMES[vid_id]
+    try:
+        with open(SESSION_FILE,"w",encoding="utf-8") as f: json.dump(d,f,ensure_ascii=False)
+    except Exception: pass
+    return jsonify({"ok":True})
+
+@app.route("/api/session/load")
+def api_session_load():
+    if not SESSION_FILE.exists(): return jsonify({"found":False})
+    try:
+        with open(SESSION_FILE,encoding="utf-8") as f: d=json.load(f)
+        vid_id=d.get("video_id"); video_url=None
+        if vid_id:
+            matches=[m for m in UPLOAD_DIR.glob(f"{vid_id}.*") if m.suffix!=".ass"]
+            if matches:
+                video_url=f"/uploads/{matches[0].name}"
+                VIDEO_NAMES[vid_id]=d.get("video_name") or matches[0].stem
+        return jsonify({"found":True,"video_id":vid_id,"video_url":video_url,
+                        "subs":d.get("subs",[]),"style":d.get("style",{})})
+    except Exception: return jsonify({"found":False})
+
+@app.route("/api/session/clear", methods=["DELETE"])
+def api_session_clear():
+    try:
+        if SESSION_FILE.exists(): SESSION_FILE.unlink()
+    except Exception: pass
+    return jsonify({"ok":True})
 
 # ── HTML ──────────────────────────────────────────────────────────────────
 HTML = r"""<!DOCTYPE html>
@@ -361,6 +423,10 @@ HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>字幕編輯器</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;700&family=Noto+Serif+TC:wght@400;700&family=Noto+Sans+HK:wght@400;700&family=Noto+Serif+HK:wght@400;700&family=Ma+Shan+Zheng&family=ZCOOL+QingKe+HuangYou&family=ZCOOL+XiaoWei&family=ZCOOL+KuaiLe&family=Zhi+Mang+Xing&family=Long+Cang&family=Liu+Jian+Mao+Cao&display=swap" rel="stylesheet">
+<link href="https://cdn.jsdelivr.net/npm/lxgw-wenkai-tc-webfont@1.1.0/style.css" rel="stylesheet">
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 :root{
@@ -374,7 +440,7 @@ HTML = r"""<!DOCTYPE html>
 body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;height:100vh;display:flex;flex-direction:column;overflow:hidden;font-size:13px}
 
 /* ── Header ── */
-header{display:flex;align-items:center;gap:6px;padding:6px 14px;background:var(--p1);border-bottom:1px solid var(--bd);flex-shrink:0;z-index:50}
+header{display:flex;align-items:center;gap:6px;padding:0 16px;background:var(--p1);border:1px solid var(--bd);border-radius:18px;flex-shrink:0;z-index:50;height:52px;margin:8px 10px 6px;box-shadow:0 4px 20px rgba(0,0,0,.45)}
 .logo{font-size:15px;font-weight:800;color:var(--txt);letter-spacing:-.5px;margin-right:4px}
 .logo b{color:var(--acc2)}
 .sep{width:1px;height:18px;background:var(--bd);margin:0 3px;flex-shrink:0}
@@ -394,13 +460,14 @@ header{display:flex;align-items:center;gap:6px;padding:6px 14px;background:var(-
 .exp-menu .exp-sep{height:1px;background:var(--bd);margin:2px 0}
 
 /* ── Content row ── */
-.content-row{display:flex;flex:1;overflow:hidden;min-height:0}
+.content-row{display:grid;grid-template-columns:6fr 4fr;flex:1;overflow:hidden;min-height:0}
 
 /* ── Left panel ── */
-.left-panel{flex:1;display:flex;flex-direction:column;background:#000;border-right:1px solid var(--bd);min-width:0}
+.left-panel{display:flex;flex-direction:column;background:#000;border-right:1px solid var(--bd);min-width:0;overflow:hidden}
 .video-wrap{flex:1;position:relative;background:#000;display:flex;align-items:center;justify-content:center;overflow:hidden;min-height:0}
-video{max-width:100%;max-height:100%;display:block}
-.sub-overlay{position:absolute;text-align:center;pointer-events:none;max-width:90%;transition:left .07s,top .07s}
+video{max-width:100%;max-height:62vh;display:block;border-radius:16px}
+#vidFrame{position:absolute;z-index:5;pointer-events:none;display:none}
+.sub-overlay{position:absolute;text-align:center;pointer-events:none;max-width:90%}
 .upload-hint{display:flex;flex-direction:column;align-items:center;gap:14px;color:var(--dim)}
 .upload-hint .ico{font-size:56px;opacity:.3}
 .upload-hint p{font-size:13px;color:var(--mut)}
@@ -439,7 +506,7 @@ video{max-width:100%;max-height:100%;display:block}
 .v-sep{width:1px;height:20px;background:var(--bd);flex-shrink:0}
 
 /* ── Right panel ── */
-.right-panel{width:380px;flex-shrink:0;display:flex;flex-direction:column;background:var(--p1);overflow:hidden}
+.right-panel{display:flex;flex-direction:column;background:var(--p1);overflow:hidden;min-width:0}
 .lhdr{display:flex;align-items:center;gap:6px;padding:8px 11px;border-bottom:1px solid var(--bd);flex-shrink:0}
 .lhdr h3{font-size:13px;font-weight:700}
 .lhdr .cnt{font-size:11px;color:var(--mut);padding:2px 7px;background:var(--p3);border-radius:99px}
@@ -503,19 +570,30 @@ video{max-width:100%;max-height:100%;display:block}
 .logbox{max-height:65px;overflow-y:auto;background:var(--bg);border-radius:5px;padding:5px 8px;font-family:'SF Mono','Fira Code',monospace;font-size:10px;color:var(--mut);line-height:1.6;margin-top:6px;display:none}
 .logbox.show{display:block}
 
-/* ── Full-width Timeline ── */
-.tl-section{flex-shrink:0;height:calc(90px + 10vh);background:#0a0f1a;border-top:1px solid var(--bd);display:flex;flex-direction:column;padding-bottom:8px}
-.tl-cv-wrap{flex:1;position:relative;overflow:hidden;min-height:0}
-.tl-toolbar{position:absolute;top:3px;right:5px;z-index:3;display:flex;gap:3px}
-.tlb{padding:2px 7px;border-radius:4px;border:1px solid var(--bd);background:rgba(13,17,23,.88);color:var(--dim);font-size:10px;font-weight:600;cursor:pointer;transition:all .12s}
+/* ── Full-width Timeline (DOM-based) ── */
+.tl-section{flex-shrink:0;background:#0a0f1a;border-top:1px solid var(--bd);padding:8px 10px 10px}
+.wf-wrap{background:#0d1520;border:1px solid var(--bd);border-radius:10px;overflow:hidden}
+.wf-holder{position:relative;overflow-x:scroll;overflow-y:hidden;height:138px;cursor:crosshair}
+.wf-holder::-webkit-scrollbar{height:10px;background:#111827}
+.wf-holder::-webkit-scrollbar-track{background:#111827}
+.wf-holder::-webkit-scrollbar-thumb{background:#3a5068;border-radius:5px;min-width:40px}
+.wf-holder::-webkit-scrollbar-thumb:hover{background:#5a7a9a}
+#tlCv{position:sticky;left:0;display:block;width:100%;height:116px;pointer-events:none;z-index:1}
+#wfInner{position:absolute;top:0;left:0;height:1px;pointer-events:none}
+#wfPlayhead{position:absolute;top:0;width:2px;height:116px;background:#f85149;z-index:5;pointer-events:none;margin-left:-1px}
+#wfRegions{position:absolute;top:20px;left:0;height:93px;pointer-events:none;z-index:2}
+.wfr{position:absolute;top:0;height:100%;border-radius:5px;background:rgba(15,118,110,.65);border:1.5px solid #99f6e4;cursor:grab;pointer-events:all}
+.wfr.act{background:rgba(194,65,12,.75);border-color:#fed7aa}
+.wfg{position:absolute;top:50%;transform:translateY(-50%);width:14px;height:14px;background:rgba(255,255,255,.75);border-radius:50%;cursor:ew-resize;pointer-events:all;flex-shrink:0}
+.wfg.l{left:-5px}.wfg.r{right:-5px}
+.wfrl{position:absolute;top:2px;left:5px;right:5px;font-size:10px;color:rgba(255,255,255,.85);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;pointer-events:none}
+.tlb{padding:2px 7px;border-radius:4px;border:1px solid var(--bd);background:var(--p3);color:var(--dim);font-size:10px;font-weight:600;cursor:pointer;transition:all .12s}
 .tlb:hover{border-color:var(--acc2);color:var(--acc2)}
-#tlCv{display:block;width:100%;height:100%;cursor:crosshair}
-#tlScrollBar{flex-shrink:0;height:10px;overflow-x:auto;overflow-y:hidden;margin:3px 10px 0;border-radius:4px}
-#tlScrollBar::-webkit-scrollbar{height:6px}
-#tlScrollBar::-webkit-scrollbar-track{background:rgba(255,255,255,.04);border-radius:3px}
-#tlScrollBar::-webkit-scrollbar-thumb{background:var(--bd);border-radius:3px;transition:background .15s}
-#tlScrollBar::-webkit-scrollbar-thumb:hover{background:var(--dim)}
-#tlScrollInner{height:1px;background:transparent}
+.wf-ctl{display:flex;align-items:center;gap:6px;padding:5px 10px 6px;background:#0a0f1a;border-top:1px solid var(--bd2)}
+.wf-ctl-btn{width:24px;height:24px;border-radius:50%;border:1px solid var(--bd);background:var(--p3);color:var(--mut);cursor:pointer;font-size:12px;display:flex;align-items:center;justify-content:center;transition:all .12s;flex-shrink:0}
+.wf-ctl-btn:hover{border-color:var(--acc2);color:var(--acc2)}
+.wf-ctl-btn.on{background:rgba(68,147,248,.15);border-color:var(--acc2);color:var(--acc2)}
+.wf-spring{flex:1}
 
 /* ── Modals ── */
 .mover{position:fixed;inset:0;background:rgba(0,0,0,.65);backdrop-filter:blur(4px);z-index:300;display:none;align-items:center;justify-content:center}
@@ -546,7 +624,7 @@ video{max-width:100%;max-height:100%;display:block}
 .shift-inp{width:100%;margin-top:8px;font-size:15px;text-align:center;padding:8px;border-radius:7px;background:var(--p3);border:1px solid var(--bd);color:var(--txt);outline:none}
 .shift-inp:focus{border-color:var(--acc)}
 /* Toast notification */
-.toast{position:fixed;bottom:90px;left:50%;transform:translateX(-50%);background:var(--p1);border:1px solid var(--bd);color:var(--txt);padding:9px 20px;border-radius:10px;font-size:13px;font-weight:600;z-index:500;pointer-events:none;box-shadow:0 4px 16px rgba(0,0,0,.5);display:flex;align-items:center;gap:8px;white-space:nowrap}
+.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--p1);border:1px solid var(--bd);color:var(--txt);padding:9px 20px;border-radius:10px;font-size:13px;font-weight:600;z-index:500;pointer-events:none;box-shadow:0 4px 16px rgba(0,0,0,.5);display:flex;align-items:center;gap:8px;white-space:nowrap}
 .toast.good{border-color:var(--grn);color:var(--grn)}
 .toast.warn{border-color:var(--yel);color:var(--yel)}
 /* Loading overlay */
@@ -560,11 +638,12 @@ video{max-width:100%;max-height:100%;display:block}
 .ld-fill{height:100%;background:linear-gradient(90deg,var(--acc),var(--acc2));border-radius:4px;transition:width .35s;width:0%}
 .ld-cancel{padding:7px 22px;border-radius:8px;border:1px solid var(--bd);background:transparent;color:var(--mut);font-size:13px;font-weight:600;cursor:pointer;margin-top:6px;transition:all .15s}
 .ld-cancel:hover{border-color:var(--red);color:var(--red)}
-/* Timeline zoom slider */
+/* Timeline zoom row */
 .tl-zoom-row{display:flex;align-items:center;gap:5px}
 .tl-zoom-lbl{font-size:10px;color:var(--dim)}
 #tlZoomBar{width:80px;height:3px;cursor:pointer;accent-color:var(--acc2);vertical-align:middle}
 #tlZoomPct{font-size:10px;color:var(--mut);min-width:36px;display:inline-block;text-align:right}
+/* Toast adjusted above timeline */
 /* Drag guide lines */
 .gl-h{position:absolute;left:0;right:0;height:0;border-top:1px dashed rgba(34,211,238,0);pointer-events:none;transition:border-color .1s}
 .gl-v{position:absolute;top:0;bottom:0;width:0;border-left:1px dashed rgba(34,211,238,0);pointer-events:none;transition:border-color .1s}
@@ -581,6 +660,7 @@ video{max-width:100%;max-height:100%;display:block}
   <div class="logo">字幕<b>編輯器</b></div>
   <button class="hbtn" onclick="document.getElementById('srtIn').click()">📂 匯入</button>
   <button class="hbtn" onclick="openPaste()">📋 貼上</button>
+  <button class="hbtn" id="btnClose" onclick="closeProject()" title="關閉目前的編輯工作" style="color:var(--red);border-color:rgba(248,81,73,.25)">✕ 關閉</button>
   <div class="sep"></div>
   <button class="hbtn" onclick="openSearch()" title="Ctrl+F">🔍 搜尋</button>
   <button class="hbtn" onclick="openShift()">⏱ 偏移</button>
@@ -614,16 +694,18 @@ video{max-width:100%;max-height:100%;display:block}
         <p style="font-size:11px">MP4、MKV、MOV、AVI…</p>
       </div>
       <video id="vid" style="display:none"></video>
-      <!-- Snap guide lines (shown during drag) -->
-      <div id="guideOv" style="position:absolute;inset:0;pointer-events:none;z-index:9;display:none">
-        <div class="gl-h" id="glTH" style="top:10%"></div>
-        <div class="gl-h" id="glCH" style="top:50%"></div>
-        <div class="gl-h" id="glBH" style="top:90%"></div>
-        <div class="gl-v" id="glLV" style="left:10%"></div>
-        <div class="gl-v" id="glCV" style="left:50%"></div>
-        <div class="gl-v" id="glRV" style="left:90%"></div>
+      <!-- vidFrame 精準疊在 video 畫面上，overlay 和 guide 都放在裡面 -->
+      <div id="vidFrame">
+        <div id="guideOv" style="position:absolute;inset:0;pointer-events:none;z-index:9;display:none">
+          <div class="gl-h" id="glTH" style="top:10%"></div>
+          <div class="gl-h" id="glCH" style="top:50%"></div>
+          <div class="gl-h" id="glBH" style="top:90%"></div>
+          <div class="gl-v" id="glLV" style="left:10%"></div>
+          <div class="gl-v" id="glCV" style="left:50%"></div>
+          <div class="gl-v" id="glRV" style="left:90%"></div>
+        </div>
+        <div class="sub-overlay" id="subOv"></div>
       </div>
-      <div class="sub-overlay" id="subOv"></div>
     </div>
 
     <div class="vc" id="vcArea" style="display:none">
@@ -642,8 +724,8 @@ video{max-width:100%;max-height:100%;display:block}
     <!-- Style strip -->
     <div class="style-strip" id="styleStrip">
       <div class="sg"><label>字體</label>
-        <select id="sFnt" onchange="updStyle()" style="max-width:180px">
-          <optgroup label="── macOS 繁中 ──">
+        <select id="sFnt" onchange="updStyle()" style="max-width:200px">
+          <optgroup label="── macOS 繁中（需已安裝）──">
             <option value="PingFang TC">蘋方繁體 PingFang TC</option>
             <option value="Heiti TC">黑體繁體 Heiti TC</option>
             <option value="Songti TC">宋體繁體 Songti TC</option>
@@ -653,14 +735,35 @@ video{max-width:100%;max-height:100%;display:block}
             <option value="BiauKai">標楷體 BiauKai</option>
             <option value="WeiBei TC">娃娃體 WeiBei TC</option>
           </optgroup>
-          <optgroup label="── Google／Adobe ──">
-            <option value="Noto Sans TC">Noto Sans TC</option>
-            <option value="Noto Serif TC">Noto Serif TC</option>
-            <option value="Source Han Sans TW">思源黑體 TW</option>
+          <optgroup label="── Noto 無襯線（Google）──">
+            <option value="Noto Sans TC">Noto Sans TC（繁）</option>
+            <option value="Noto Sans HK">Noto Sans HK（港）</option>
           </optgroup>
-          <optgroup label="── Windows 繁中 ──">
+          <optgroup label="── Noto 襯線（Google）──">
+            <option value="Noto Serif TC">Noto Serif TC（繁）</option>
+            <option value="Noto Serif HK">Noto Serif HK（港）</option>
+          </optgroup>
+          <optgroup label="── 思源（Adobe）──">
+            <option value="Source Han Sans TW">思源黑體 Source Han Sans TC</option>
+            <option value="Source Han Serif TW">思源宋體 Source Han Serif TC</option>
+          </optgroup>
+          <optgroup label="── Google 創意繁中 ──">
+            <option value="Ma Shan Zheng">Ma Shan Zheng（馬善政）</option>
+            <option value="ZCOOL QingKe HuangYou">站酷青柯黃油體</option>
+            <option value="ZCOOL XiaoWei">站酷小薇Logo體</option>
+            <option value="ZCOOL KuaiLe">站酷快樂體</option>
+            <option value="Zhi Mang Xing">指芒星 Zhi Mang Xing</option>
+            <option value="Long Cang">龍藏 Long Cang</option>
+            <option value="Liu Jian Mao Cao">劉劍茅草 Liu Jian Mao Cao</option>
+          </optgroup>
+          <optgroup label="── 霞鶩開源（CDN）──">
+            <option value="LXGW WenKai TC">霞鶩文楷 TC</option>
+            <option value="LXGW WenKai Mono TC">霞鶩文楷等寬 TC</option>
+          </optgroup>
+          <optgroup label="── Windows 繁中（需已安裝）──">
             <option value="Microsoft JhengHei">微軟正黑體</option>
             <option value="PMingLiU">新細明體 PMingLiU</option>
+            <option value="MingLiU">細明體 MingLiU</option>
           </optgroup>
           <optgroup label="── Western ──">
             <option value="Arial" selected>Arial</option>
@@ -694,6 +797,9 @@ video{max-width:100%;max-height:100%;display:block}
       </div>
       <div class="sg" id="bgOpaG"><label>透明度</label>
         <input type="range" id="sOpa" min="0" max="1" step="0.05" value="0.75" oninput="updStyle()">
+      </div>
+      <div class="sg" id="strkWG" style="display:none"><label>描邊粗細</label>
+        <input type="number" id="sStrk" value="3" min="1" max="20" style="width:50px" onchange="updStyle()">
       </div>
       <div class="v-sep"></div>
       <div class="sg"><label>快速位置</label>
@@ -767,18 +873,29 @@ video{max-width:100%;max-height:100%;display:block}
   </div>
 </div>
 
-<!-- Timeline (full width) -->
+<!-- Timeline (full width, DOM-based) -->
 <div class="tl-section" id="tlSec" style="display:none">
-  <div class="tl-cv-wrap">
-    <div class="tl-toolbar" style="display:flex;align-items:center;gap:5px">
-      <span class="tl-zoom-lbl">縮放</span>
-      <input type="range" id="tlZoomBar" min="0" max="100" value="0" oninput="tlZoomSlide(this.value)">
-      <span id="tlZoomPct">100%</span>
-      <button class="tlb" onclick="tlFit()">全覽</button>
+  <div class="wf-wrap">
+    <div class="wf-holder" id="wfHolder">
+      <canvas id="tlCv"></canvas>
+      <div id="wfInner"></div>
+      <div id="wfPlayhead"></div>
+      <div id="wfRegions"></div>
     </div>
-    <canvas id="tlCv"></canvas>
+    <div class="wf-ctl">
+      <button class="wf-ctl-btn" id="wfSnapBtn" title="磁力吸附（拖曳時自動對齊）">🧲</button>
+      <button class="wf-ctl-btn on" id="wfFollowBtn" title="播放時自動跟隨播放頭">👁</button>
+      <div class="wf-spring"></div>
+      <div class="tl-zoom-row">
+        <span class="tl-zoom-lbl">縮放</span>
+        <button class="tlb" onclick="tlZoomStep(-1)">−</button>
+        <input type="range" id="tlZoomBar" min="0" max="100" value="0" oninput="tlZoomSlide(this.value)">
+        <button class="tlb" onclick="tlZoomStep(1)">＋</button>
+        <span id="tlZoomPct">100%</span>
+        <button class="tlb" onclick="tlFit()">全覽</button>
+      </div>
+    </div>
   </div>
-  <div id="tlScrollBar"><div id="tlScrollInner"></div></div>
 </div>
 
 <!-- Loading overlay -->
@@ -842,9 +959,10 @@ video{max-width:100%;max-height:100%;display:block}
     <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
       <label style="font-size:12px;color:var(--mut)">品質</label>
       <select id="burnCrf" style="background:var(--p3);border:1px solid var(--bd);color:var(--txt);border-radius:5px;padding:4px 8px;font-size:12px;outline:none">
-        <option value="15">極高品質（CRF 15，檔案較大）</option>
-        <option value="18" selected>高品質（CRF 18，推薦）</option>
-        <option value="23">一般品質（CRF 23，較小）</option>
+        <option value="0" selected>無損（CRF 0，檔案最大）</option>
+        <option value="15">極高品質（CRF 15）</option>
+        <option value="18">高品質（CRF 18）</option>
+        <option value="23">一般品質（CRF 23）</option>
       </select>
     </div>
     <div class="mbtns">
@@ -862,7 +980,7 @@ let subs=[], activeIdx=-1, videoId=null, jobId=null, pollTmr=null;
 // ── Subtitle style state ──────────────────────────────────────────────────
 let st={fontName:'Arial',fontSize:36,bold:false,italic:false,
         textColor:'#ffffff',bgStyle:'box',bgColor:'#000000',bgOpacity:.75,
-        xPct:50,yPct:90};
+        strokeWidth:3,xPct:50,yPct:90};
 
 // ── Time helpers ──────────────────────────────────────────────────────────
 function s2srt(s){
@@ -893,8 +1011,8 @@ function parseSRT(txt){
 // ── Undo/Redo ────────────────────────────────────────────────────────────
 let uStack=[],rStack=[];
 function push(){uStack.push(JSON.stringify(subs));if(uStack.length>80)uStack.shift();rStack=[];updUR();}
-function undo(){if(!uStack.length)return;rStack.push(JSON.stringify(subs));subs=JSON.parse(uStack.pop());activeIdx=-1;renderList();renderTL();updUR();}
-function redo(){if(!rStack.length)return;uStack.push(JSON.stringify(subs));subs=JSON.parse(rStack.pop());activeIdx=-1;renderList();renderTL();updUR();}
+function undo(){if(!uStack.length)return;rStack.push(JSON.stringify(subs));subs=JSON.parse(uStack.pop());activeIdx=-1;renderList();renderTL();renderRegions();updUR();}
+function redo(){if(!rStack.length)return;uStack.push(JSON.stringify(subs));subs=JSON.parse(rStack.pop());activeIdx=-1;renderList();renderTL();renderRegions();updUR();}
 function updUR(){document.getElementById('btnU').disabled=!uStack.length;document.getElementById('btnR').disabled=!rStack.length;}
 
 // ── Style controls ────────────────────────────────────────────────────────
@@ -905,11 +1023,12 @@ function toggleStyle(){
   b.classList.toggle('active',s.classList.contains('show'));
 }
 function updStyle(){
-  st.fontName =document.getElementById('sFnt').value;
-  st.fontSize =parseInt(document.getElementById('sFsz').value)||36;
-  st.textColor=document.getElementById('sTxt').value;
-  st.bgColor  =document.getElementById('sBg').value;
-  st.bgOpacity=parseFloat(document.getElementById('sOpa').value);
+  st.fontName   =document.getElementById('sFnt').value;
+  st.fontSize   =parseInt(document.getElementById('sFsz').value)||36;
+  st.textColor  =document.getElementById('sTxt').value;
+  st.bgColor    =document.getElementById('sBg').value;
+  st.bgOpacity  =parseFloat(document.getElementById('sOpa').value);
+  st.strokeWidth=parseInt(document.getElementById('sStrk').value)||3;
   applyOvStyle();
 }
 function toggleFmt(k){
@@ -923,6 +1042,7 @@ function setBg(el,v){
   const hasColor=v!=='none';
   document.getElementById('bgColG').style.display=hasColor?'':'none';
   document.getElementById('bgOpaG').style.display=(v==='box'||v==='outline')?'':'none';
+  document.getElementById('strkWG').style.display=(v==='outline')?'':'none';
   applyOvStyle();
 }
 // Position shortcuts: snap to standard positions
@@ -939,6 +1059,7 @@ function updatePosReadout(){
   if(el) el.textContent=`X:${Math.round(st.xPct)}% Y:${Math.round(st.yPct)}%`;
 }
 function applyOvStyle(){
+  syncVidFrame();
   const ov=document.getElementById('subOv');
   ov.style.left=st.xPct+'%';
   ov.style.top=st.yPct+'%';
@@ -948,11 +1069,35 @@ function applyOvStyle(){
   const t=activeIdx>=0&&subs[activeIdx]?subs[activeIdx].text:'';
   renderOv(t);
 }
+// ── vidFrame：精準疊在 <video> 畫面上的絕對定位容器 ──────────────────────────
+function syncVidFrame(){
+  const f=document.getElementById('vidFrame');
+  if(!vid.clientWidth){f.style.display='none';return;}
+  const vr=vid.getBoundingClientRect();
+  const wr=document.getElementById('vWrap').getBoundingClientRect();
+  f.style.left=(vr.left-wr.left)+'px';
+  f.style.top=(vr.top-wr.top)+'px';
+  f.style.width=vr.width+'px';
+  f.style.height=vr.height+'px';
+  f.style.display='block';
+}
+
 function buildSpanSt(){
-  let s=`font-family:${st.fontName};font-size:${st.fontSize}px;color:${st.textColor};`;
+  // Scale font to match burn output: ASS reference is 1080px height (PlayResY:1080)
+  // so fontSize:36 means 36/1080 of video height — scale overlay to match exactly
+  const f=document.getElementById('vidFrame');
+  const dispH=f&&f.clientHeight>0?f.clientHeight:vid.clientHeight;
+  const scale=dispH>0?dispH/1080:1;
+  const px=Math.max(6,Math.round(st.fontSize*scale));
+  let s=`font-family:${st.fontName};font-size:${px}px;color:${st.textColor};`;
   s+=`font-weight:${st.bold?700:400};font-style:${st.italic?'italic':'normal'};`;
   if(st.bgStyle==='none'){s+='background:transparent;padding:2px 8px;text-shadow:1px 1px 3px #000,-1px -1px 3px #000;';}
-  else if(st.bgStyle==='outline'){s+=`background:transparent;padding:2px 8px;text-shadow:1px 1px 3px #000,-1px -1px 3px #000,1px -1px 3px #000,-1px 1px 3px #000,0 0 8px #000;`;}
+  else if(st.bgStyle==='outline'){
+    const sw=Math.max(1,st.strokeWidth||3);
+    const d=sw,d2=Math.round(sw*0.7)||1;
+    const shs=`${d}px 0 0 #000,-${d}px 0 0 #000,0 ${d}px 0 #000,0 -${d}px 0 #000,${d2}px ${d2}px 0 #000,-${d2}px ${d2}px 0 #000,${d2}px -${d2}px 0 #000,-${d2}px -${d2}px 0 #000`;
+    s+=`background:transparent;padding:2px 8px;text-shadow:${shs};`;
+  }
   else if(st.bgStyle==='solid'){s+=`background:${st.bgColor};padding:4px 14px;border-radius:4px;`;}
   else{s+=`background:${hex2rgba(st.bgColor,st.bgOpacity)};padding:4px 14px;border-radius:6px;`;}
   return s;
@@ -1056,36 +1201,37 @@ function selSub(i){
   activeIdx=i;
   if(subs[i]&&!isNaN(subs[i].start)) vid.currentTime=subs[i].start;
   document.querySelectorAll('.srow').forEach((r,j)=>r.classList.toggle('act',j===i));
-  renderTL();
+  renderTL();renderRegions();
+  applyOvStyle();  // 立即在 overlay 顯示選中字幕
 }
-function onTC(i,f,v){push();try{const s=srt2s(v);if(!isNaN(s)){subs[i][f]=s;renderTL();}}catch(e){}}
-function onTxt(i,v){push();subs[i].text=v;}
+function onTC(i,f,v){push();try{const s=srt2s(v);if(!isNaN(s)){subs[i][f]=s;renderTL();renderRegions();}}catch(e){}}
+function onTxt(i,v){push();subs[i].text=v;renderRegions();if(i===activeIdx)renderOv(v);}
 
 function addSub(){
   push();
   const last=subs.length?subs[subs.length-1].end:vid.currentTime||0;
   subs.push({start:last+.2,end:last+2.2,text:''});
-  renderList();renderTL();
+  renderList();renderTL();renderRegions();tlUpdLayout();
   setTimeout(()=>{const i=subs.length-1;document.getElementById(`row-${i}`)?.scrollIntoView({block:'nearest'});document.getElementById(`tx-${i}`)?.focus();},50);
 }
 function addAfter(i){
   push();
   const c=subs[i],n=subs[i+1],g=n?n.start:c.end+3,s=c.end+.2,e=Math.min(s+2,g-.1);
   subs.splice(i+1,0,{start:s,end:e,text:''});
-  renderList();renderTL();
+  renderList();renderTL();renderRegions();tlUpdLayout();
   setTimeout(()=>{document.getElementById(`tx-${i+1}`)?.focus();document.getElementById(`row-${i+1}`)?.scrollIntoView({block:'nearest'});},50);
 }
-function delSub(i){push();subs.splice(i,1);if(activeIdx>=subs.length)activeIdx=subs.length-1;renderList();renderTL();}
+function delSub(i){push();subs.splice(i,1);if(activeIdx>=subs.length)activeIdx=subs.length-1;renderList();renderTL();renderRegions();}
 function splitSub(i){
   push();
   const s=subs[i],mid=(s.start+s.end)/2,ws=s.text.split(/\s+/),h=Math.ceil(ws.length/2);
   subs.splice(i,1,{start:s.start,end:mid-.05,text:ws.slice(0,h).join(' ')},{start:mid,end:s.end,text:ws.slice(h).join(' ')});
-  renderList();renderTL();
+  renderList();renderTL();renderRegions();
 }
 function mergeUp(i){
   if(!i)return;push();
   subs[i-1].end=subs[i].end;subs[i-1].text=(subs[i-1].text+' '+subs[i].text).trim();
-  subs.splice(i,1);renderList();renderTL();
+  subs.splice(i,1);renderList();renderTL();renderRegions();
 }
 
 // ── Video sync ────────────────────────────────────────────────────────────
@@ -1100,12 +1246,15 @@ vid.addEventListener('timeupdate',()=>{
     document.querySelectorAll('.srow').forEach((r,j)=>r.classList.toggle('act',j===idx));
     if(idx>=0)document.getElementById(`row-${idx}`)?.scrollIntoView({block:'nearest',behavior:'smooth'});
   }
-  if(tlVis){const px=tlT2X(t),W=tlCv.width;if(px<W*.1||px>W*.88){tlOff=t-W*.2/tlPPS;tlClamp();}}
+  if(tlVis){movePh();if(wfFollow&&!vid.paused){const px=t*tlPPS,W=wfHolder.clientWidth,sx=wfHolder.scrollLeft;if(px<sx+W*.1||px>sx+W*.85)wfHolder.scrollLeft=Math.max(0,px-W*.4);}}
 });
 vid.addEventListener('play',()=>{document.getElementById('btnPlay').textContent='⏸';tlStartLoop();});
 vid.addEventListener('pause',()=>{document.getElementById('btnPlay').textContent='▶';tlStopLoop();renderTL();});
 vid.addEventListener('ended',()=>{document.getElementById('btnPlay').textContent='▶';tlStopLoop();});
 vid.addEventListener('loadedmetadata',initTL);
+// 影片載入後 / 視窗縮放時：syncVidFrame 讓 overlay 精準對齊影片畫面
+vid.addEventListener('loadedmetadata',()=>requestAnimationFrame(()=>{syncVidFrame();applyOvStyle();}));
+window.addEventListener('resize',()=>{syncVidFrame();applyOvStyle();});
 
 document.getElementById('seekBar').addEventListener('input',function(){vid.currentTime=vid.duration*this.value/100;renderTL();});
 function togglePlay(){vid.paused?vid.play():vid.pause();}
@@ -1150,17 +1299,17 @@ function loadVid(url){
 function onSrtPick(inp){
   const f=inp.files[0];if(!f)return;
   const r=new FileReader();
-  r.onload=e=>{const p=parseSRT(e.target.result);if(!p.length){alert('無法解析 SRT');return;}push();subs=p;renderList();renderTL();document.getElementById('pLbl').textContent=`已載入 ${subs.length} 段`;};
+  r.onload=e=>{const p=parseSRT(e.target.result);if(!p.length){alert('無法解析 SRT');return;}push();subs=p;renderList();renderTL();renderRegions();tlUpdLayout();document.getElementById('pLbl').textContent=`已載入 ${subs.length} 段`;};
   r.readAsText(f,'utf-8');inp.value='';
 }
 function openPaste(){document.getElementById('pasteM').classList.add('open');document.getElementById('pasteA').value='';setTimeout(()=>document.getElementById('pasteA').focus(),80);}
 function closePaste(){document.getElementById('pasteM').classList.remove('open');}
-function doPaste(){const t=document.getElementById('pasteA').value.trim();if(!t){closePaste();return;}const p=parseSRT(t);if(!p.length){alert('無法解析 SRT');return;}push();subs=p;renderList();renderTL();closePaste();document.getElementById('pLbl').textContent=`已載入 ${subs.length} 段`;}
+function doPaste(){const t=document.getElementById('pasteA').value.trim();if(!t){closePaste();return;}const p=parseSRT(t);if(!p.length){alert('無法解析 SRT');return;}push();subs=p;renderList();renderTL();renderRegions();tlUpdLayout();closePaste();document.getElementById('pLbl').textContent=`已載入 ${subs.length} 段`;}
 
 // ── Shift ─────────────────────────────────────────────────────────────────
 function openShift(){document.getElementById('shiftM').classList.add('open');document.getElementById('shiftV').value='0';setTimeout(()=>{document.getElementById('shiftV').focus();document.getElementById('shiftV').select();},80);}
 function closeShift(){document.getElementById('shiftM').classList.remove('open');}
-function doShift(){const sec=(parseFloat(document.getElementById('shiftV').value)||0)/1000;push();subs=subs.map(s=>({...s,start:Math.max(0,s.start+sec),end:Math.max(0,s.end+sec)}));renderList();renderTL();closeShift();}
+function doShift(){const sec=(parseFloat(document.getElementById('shiftV').value)||0)/1000;push();subs=subs.map(s=>({...s,start:Math.max(0,s.start+sec),end:Math.max(0,s.end+sec)}));renderList();renderTL();renderRegions();closeShift();}
 
 // ── Search & Replace ──────────────────────────────────────────────────────
 let srRes=[],srIdx=-1;
@@ -1240,7 +1389,7 @@ async function runAutoAlign(manual){
       start:Math.max(0,parseFloat((s.start+offset).toFixed(3))),
       end:Math.max(0,parseFloat((s.end+offset).toFixed(3)))
     }));
-    renderList();renderTL();
+    renderList();renderTL();renderRegions();
     const sign=offset>0?'+':'';
     showToast(`已自動校時 ${sign}${Math.round(offset*1000)}ms（語音起點 ${speechStart.toFixed(2)}s）`,'good',4000);
   }catch(e){
@@ -1259,13 +1408,13 @@ function dl(content,name,mime){const a=document.createElement('a');a.href=URL.cr
 function exportSRT(){
   if(!subs.length){alert('沒有字幕');return;}
   fetch('/api/export_srt',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({segments:subs})})
-  .then(r=>r.blob()).then(b=>{const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='subtitles.srt';a.click();});
+  .then(r=>r.blob()).then(b=>{const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='subtitles.srt';a.click();sessionClear();});
 }
 function exportVTT(){
   if(!subs.length){alert('沒有字幕');return;}
   let v='WEBVTT\n\n';
   subs.forEach((s,i)=>{v+=`${i+1}\n${s2srt(s.start).replace(',','.')} --> ${s2srt(s.end).replace(',','.')}\n${s.text}\n\n`;});
-  dl(v,'subtitles.vtt','text/vtt');
+  dl(v,'subtitles.vtt','text/vtt');sessionClear();
 }
 function exportASS(){
   if(!subs.length){alert('沒有字幕');return;}
@@ -1273,13 +1422,13 @@ function exportASS(){
   function hex2ass(h,a=1){const r=parseInt(h.slice(1,3),16),g=parseInt(h.slice(3,5),16),b=parseInt(h.slice(5,7),16),al=Math.round((1-a)*255);return`&H${al.toString(16).padStart(2,'0').toUpperCase()}${b.toString(16).padStart(2,'0').toUpperCase()}${g.toString(16).padStart(2,'0').toUpperCase()}${r.toString(16).padStart(2,'0').toUpperCase()}`;}
   const tcol=hex2ass(st.textColor);
   const bs=st.bgStyle==='none'?1:st.bgStyle==='outline'?1:3;
-  const outline=st.bgStyle==='outline'?2:0,shadow=st.bgStyle==='outline'?1:0;
+  const outline=st.bgStyle==='outline'?(st.strokeWidth||3):0,shadow=st.bgStyle==='outline'?1:0;
   const bcol=st.bgStyle==='none'?'&H00000000':st.bgStyle==='solid'?hex2ass(st.bgColor,1):hex2ass(st.bgColor,st.bgOpacity);
   const px=Math.round(st.xPct/100*1920),py=Math.round(st.yPct/100*1080);
   const posTag=`{\\an5\\pos(${px},${py})}`;
   const hdr=`[Script Info]\nScriptType: v4.00+\nPlayResX: 1920\nPlayResY: 1080\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,${fn},${fs},${tcol},&H000000FF,&H00000000,${bcol},${bold},${italic},0,0,100,100,0,0,${bs},${outline},${shadow},5,10,10,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n`;
   const body=subs.map(s=>`Dialogue: 0,${s2ass(s.start)},${s2ass(s.end)},Default,,0,0,0,,${posTag}${s.text.replace(/\n/g,'\\N')}`).join('\n');
-  dl(hdr+body+'\n','subtitles.ass','text/plain');
+  dl(hdr+body+'\n','subtitles.ass','text/plain');sessionClear();
 }
 
 // ── Burn ──────────────────────────────────────────────────────────────────
@@ -1310,11 +1459,84 @@ function pollBurn(){
   if(!burnId)return;
   fetch(`/api/burn_job/${burnId}`).then(r=>r.json()).then(d=>{
     updateLoading(d.progress||0,`燒錄中… ${d.progress||0}%`);
-    if(d.status==='done'){hideLoading();window.location.href=`/api/burn_download/${burnId}`;burnId=null;}
+    if(d.status==='done'){hideLoading();sessionClear();window.location.href=`/api/burn_download/${burnId}`;burnId=null;}
     else if(d.status==='cancelled'){hideLoading();burnId=null;}
     else if(d.status==='error'){hideLoading();alert('燒錄失敗：'+(d.error||'未知錯誤'));burnId=null;}
     else burnPoll=setTimeout(pollBurn,1000);
   }).catch(()=>{burnPoll=setTimeout(pollBurn,2000);});
+}
+
+// ── Session persistence ────────────────────────────────────────────────────
+function restoreStyle(s){
+  Object.assign(st,s);
+  const g=id=>document.getElementById(id);
+  if(g('sFnt'))g('sFnt').value=st.fontName;
+  if(g('sFsz'))g('sFsz').value=st.fontSize;
+  g('fmtB')?.classList.toggle('on',!!st.bold);
+  g('fmtI')?.classList.toggle('on',!!st.italic);
+  if(g('sTxt'))g('sTxt').value=st.textColor;
+  if(g('sBg'))g('sBg').value=st.bgColor;
+  if(g('sOpa'))g('sOpa').value=st.bgOpacity;
+  if(g('sStrk'))g('sStrk').value=st.strokeWidth;
+  document.querySelectorAll('.bg-opt').forEach(b=>b.classList.toggle('on',b.dataset.v===st.bgStyle));
+  const hasColor=st.bgStyle!=='none';
+  g('bgColG').style.display=hasColor?'':'none';
+  g('bgOpaG').style.display=(st.bgStyle==='box'||st.bgStyle==='outline')?'':'none';
+  g('strkWG').style.display=(st.bgStyle==='outline')?'':'none';
+  updatePosReadout();applyOvStyle();
+}
+function sessionClear(){fetch('/api/session/clear',{method:'DELETE'}).catch(()=>{});}
+function sessionSave(){
+  if(!subs.length&&!videoId)return;
+  navigator.sendBeacon('/api/session/save',new Blob([JSON.stringify({video_id:videoId,subs,style:st})],{type:'application/json'}));
+}
+async function sessionLoad(){
+  try{
+    const r=await fetch('/api/session/load');
+    const d=await r.json();
+    if(!d.found)return;
+    if(d.subs?.length){subs=d.subs;renderList();renderTL();renderRegions();}
+    if(d.style&&Object.keys(d.style).length)restoreStyle(d.style);
+    if(d.video_url&&d.video_id){
+      videoId=d.video_id;loadVid(d.video_url);
+      showToast('已恢復上次的編輯工作','good',4000);
+    }else if(d.subs?.length){
+      showToast('已恢復上次字幕（影片已消失，請重新匯入）','warn',5000);
+    }
+  }catch(e){console.warn('Session load failed:',e);}
+}
+window.addEventListener('beforeunload',sessionSave);
+
+function closeProject(){
+  if(!subs.length&&!videoId)return;
+  if(!confirm('確定要關閉目前的編輯工作？\n字幕和影片都將清除，此操作無法復原。'))return;
+  sessionClear();
+  // 取消進行中的工作
+  if(jobId){fetch(`/api/job/${jobId}/cancel`,{method:'POST'});jobId=null;}
+  if(burnId){fetch(`/api/burn_job/${burnId}/cancel`,{method:'POST'});burnId=null;}
+  clearTimeout(pollTmr);clearTimeout(burnPoll);
+  tlStopLoop();
+  // 重置 state
+  subs=[];activeIdx=-1;videoId=null;uStack=[];rStack=[];wfPeaks=null;tlVis=false;
+  // 重置影片
+  vid.pause();vid.removeAttribute('src');vid.load();
+  vid.style.display='none';
+  document.getElementById('uHint').style.display='';
+  document.getElementById('vcArea').style.display='none';
+  document.getElementById('tlSec').style.display='none';
+  document.getElementById('vidFrame').style.display='none';
+  document.getElementById('subOv').innerHTML='';
+  // 重置字幕列表
+  renderList();renderRegions();updUR();
+  // 重置轉錄 UI
+  document.getElementById('btnGo').disabled=false;
+  document.getElementById('btnStop').style.display='none';
+  document.getElementById('sDot').className='sdot';
+  document.getElementById('pLbl').textContent='等待轉錄…';
+  document.getElementById('pFill').style.width='0%';
+  document.getElementById('logBox').textContent='';
+  document.getElementById('logBox').classList.remove('show');
+  hideLoading();
 }
 
 // ── Transcribe bar toggle ─────────────────────────────────────────────────
@@ -1349,10 +1571,7 @@ function pollTx(){
       d.status==='running'?`轉錄中… ${p}%`:d.status==='done'?`✅ 完成 ${(d.segments||[]).length} 段`:
       d.status==='cancelled'?'⚠️ 已取消':`❌ ${d.error||d.status}`;
     if(d.log?.length){document.getElementById('logBox').textContent=d.log.join('\n');document.getElementById('logBox').scrollTop=9999;}
-    if(d.status==='done'&&d.segments){push();subs=d.segments;renderList();renderTL();txDone('done');
-      // Auto-align timing after transcription (non-blocking, silent if <150ms off)
-      setTimeout(()=>runAutoAlign(false),800);
-    }
+    if(d.status==='done'&&d.segments){push();subs=d.segments;renderList();renderTL();renderRegions();txDone('done');}
     else if(d.status==='error'||d.status==='cancelled')txDone(d.status);
     else pollTmr=setTimeout(pollTx,1000);
   }).catch(()=>{pollTmr=setTimeout(pollTx,2000);});
@@ -1362,89 +1581,159 @@ function txDone(s){document.getElementById('btnGo').disabled=false;document.getE
 
 // ── Timeline ──────────────────────────────────────────────────────────────
 const tlCv=document.getElementById('tlCv'),tlCtx=tlCv.getContext('2d');
+const wfHolder=document.getElementById('wfHolder');
+const wfInnerEl=document.getElementById('wfInner');
+const wfPlayheadEl=document.getElementById('wfPlayhead');
+const wfRegionsEl=document.getElementById('wfRegions');
 let wfPeaks=null,tlPPS=50,tlOff=0,tlDrag=null,tlPan=null,tlRAF=null,tlVis=false,ovDrag=false,snapIndicator=null;
+let wfSnap=false,wfFollow=true,_wfRegDrag=null;
 
 function tlT2X(t){return(t-tlOff)*tlPPS;}
 function tlX2T(x){return x/tlPPS+tlOff;}
 function tlClamp(){const mx=Math.max(0,(vid.duration||0)-tlCv.width/tlPPS);tlOff=Math.max(0,Math.min(tlOff,mx));}
 
 function initTL(){
-  const wrap=document.querySelector('.tl-cv-wrap');
-  tlCv.width=wrap.clientWidth||wrap.offsetWidth;
-  tlCv.height=wrap.clientHeight||wrap.offsetHeight;
-  if(vid.duration){tlPPS=tlCv.width/vid.duration;tlOff=0;}
-  renderTL();tlSyncZoomBar();tlUpdateScrollBar();
-  if(videoId&&!wfPeaks) loadWf();
+  const W=wfHolder.clientWidth;
+  if(!W){requestAnimationFrame(initTL);return;}
+  const H=116,sizeChanged=(tlCv.width!==W);
+  tlCv.width=W;tlCv.height=H;
+  wfPlayheadEl.style.height=H+'px';
+  if(vid.duration&&(sizeChanged||tlPPS===50)){tlPPS=W/vid.duration;tlOff=0;}
+  tlUpdLayout();renderTL();renderRegions();tlSyncZoomBar();
+  if(videoId&&(!wfPeaks||sizeChanged)){wfPeaks=null;loadWf();}
 }
 new ResizeObserver(()=>{if(tlVis)initTL();}).observe(document.getElementById('tlSec'));
 
-// ── Timeline scrollbar ────────────────────────────────────────────────────
-function tlUpdateScrollBar(){
-  const sb=document.getElementById('tlScrollBar'),si=document.getElementById('tlScrollInner');
-  if(!sb||!vid.duration)return;
-  si.style.width=Math.round(vid.duration*tlPPS)+'px';
-  sb._ignoreScroll=true;
-  sb.scrollLeft=Math.round(tlOff*tlPPS);
-  sb._ignoreScroll=false;
+// ── Scroll ────────────────────────────────────────────────────────────────
+function tlUpdLayout(){
+  if(!vid.duration)return;
+  const totalW=Math.max(tlCv.width,Math.round(vid.duration*tlPPS));
+  wfInnerEl.style.width=totalW+'px';
+  wfRegionsEl.style.width=totalW+'px';
+  wfHolder._ign=true;
+  wfHolder.scrollLeft=Math.round(tlOff*tlPPS);
+  wfHolder._ign=false;
 }
-document.getElementById('tlScrollBar').addEventListener('scroll',function(){
-  if(this._ignoreScroll)return;
-  tlOff=this.scrollLeft/tlPPS;tlClamp();renderTL();
+function tlUpdateScrollBar(){tlUpdLayout();}
+
+wfHolder.addEventListener('scroll',function(){
+  if(this._ign)return;
+  tlOff=this.scrollLeft/tlPPS;
+  renderTL();renderRegions();
 });
 
+// ── DOM regions ────────────────────────────────────────────────────────────
+function renderRegions(){
+  if(!wfRegionsEl||!vid.duration)return;
+  wfRegionsEl.innerHTML='';
+  subs.forEach((s,i)=>{
+    const x=s.start*tlPPS,w=Math.max(4,(s.end-s.start)*tlPPS);
+    const div=document.createElement('div');
+    div.className='wfr'+(i===activeIdx?' act':'');
+    div.style.cssText='left:'+x+'px;width:'+w+'px';
+    div.dataset.idx=i;
+    div.innerHTML=
+      '<div class="wfg l" data-i="'+i+'" data-t="l"></div>'+
+      '<div class="wfrl">'+esc(s.text)+'</div>'+
+      '<div class="wfg r" data-i="'+i+'" data-t="r"></div>';
+    div.addEventListener('mousedown',e=>{
+      if(e.target.classList.contains('wfg'))return;
+      e.stopPropagation();
+      if(activeIdx!==i){activeIdx=i;document.querySelectorAll('.srow').forEach((r,j)=>r.classList.toggle('act',j===i));document.getElementById('row-'+i)?.scrollIntoView({block:'nearest'});}
+      push();startWfDrag(e,i,'move');
+    });
+    wfRegionsEl.appendChild(div);
+  });
+  wfRegionsEl.querySelectorAll('.wfg').forEach(el=>{
+    el.addEventListener('mousedown',e=>{
+      e.stopPropagation();
+      push();startWfDrag(e,+el.dataset.i,el.dataset.t==='l'?'left':'right');
+    });
+  });
+}
+
+function startWfDrag(e,i,type){
+  e.preventDefault();
+  _wfRegDrag={i,type,sx:e.clientX,os:subs[i].start,oe:subs[i].end};
+}
+function onWfRegDrag(e){
+  if(!_wfRegDrag)return;
+  const dt=(e.clientX-_wfRegDrag.sx)/tlPPS,s=subs[_wfRegDrag.i],dur=vid.duration||1;
+  snapIndicator=null;
+  if(_wfRegDrag.type==='move'){
+    const len=_wfRegDrag.oe-_wfRegDrag.os;
+    s.start=snapTime(Math.max(0,Math.min(dur-len,_wfRegDrag.os+dt)),_wfRegDrag.i);
+    s.end=s.start+len;
+  }else if(_wfRegDrag.type==='left'){
+    s.start=snapTime(Math.max(0,Math.min(_wfRegDrag.oe-.1,_wfRegDrag.os+dt)),_wfRegDrag.i);
+  }else{
+    s.end=snapTime(Math.max(s.start+.1,Math.min(dur,_wfRegDrag.oe+dt)),_wfRegDrag.i);
+  }
+  const si=document.getElementById('ts-'+_wfRegDrag.i),ei=document.getElementById('te-'+_wfRegDrag.i);
+  if(si)si.value=s2srt(s.start);if(ei)ei.value=s2srt(s.end);
+  renderRegions();renderTL();
+}
+
+// ── Playhead ──────────────────────────────────────────────────────────────
+function movePh(){
+  if(!vid.duration)return;
+  wfPlayheadEl.style.left=vid.currentTime*tlPPS+'px';
+}
+
+// ── Snap / Follow toggles ─────────────────────────────────────────────────
+document.getElementById('wfSnapBtn').addEventListener('click',()=>{
+  wfSnap=!wfSnap;
+  document.getElementById('wfSnapBtn').classList.toggle('on',wfSnap);
+});
+document.getElementById('wfFollowBtn').addEventListener('click',()=>{
+  wfFollow=!wfFollow;
+  document.getElementById('wfFollowBtn').classList.toggle('on',wfFollow);
+});
+
+// ── renderTL (canvas: waveform + ruler + snap indicator + long-press ring) ──
 function tlTickInterval(vis){for(const t of[.5,1,2,5,10,15,30,60,120,300,600,1800,3600])if(t>=vis/10)return t;return 3600;}
 
 function renderTL(){
   const W=tlCv.width,H=tlCv.height;if(!W||!H)return;
-  const ctx=tlCtx,RH=20,BT=RH+3,BH=H-RH-6;
+  const ctx=tlCtx,RH=20;
   ctx.fillStyle='#080d14';ctx.fillRect(0,0,W,H);
 
   // Waveform
   if(wfPeaks&&vid.duration){
-    const mid=RH+(H-RH)*.5,amp=(H-RH)*.4;
-    ctx.fillStyle='#162032';
+    const mid=RH+(H-RH)*.5,amp=(H-RH)*.42;
+    const playedX=tlT2X(vid.currentTime||0);
+    ctx.fillStyle='#0d1828';ctx.fillRect(0,RH,W,H-RH);
+    // unplayed
+    ctx.beginPath();ctx.moveTo(0,mid);
     for(let px=0;px<W;px++){
       const t=tlX2T(px);if(t<0||t>vid.duration)continue;
-      const idx=Math.floor(t/vid.duration*wfPeaks.length);
-      const v=wfPeaks[Math.min(idx,wfPeaks.length-1)];
-      const h=Math.max(1,v*amp);
-      ctx.fillRect(px,mid-h,1,h*2);
+      const v=wfPeaks[Math.min(Math.floor(t/vid.duration*wfPeaks.length),wfPeaks.length-1)];
+      ctx.lineTo(px,mid-Math.max(1.5,v*amp));
+    }
+    for(let px=W-1;px>=0;px--){
+      const t=tlX2T(px);if(t<0||t>vid.duration)continue;
+      const v=wfPeaks[Math.min(Math.floor(t/vid.duration*wfPeaks.length),wfPeaks.length-1)];
+      ctx.lineTo(px,mid+Math.max(1.5,v*amp));
+    }
+    ctx.closePath();ctx.fillStyle='#2c5d8f';ctx.fill();
+    // played
+    if(playedX>0){
+      ctx.save();ctx.beginPath();ctx.rect(0,RH,Math.min(playedX,W),H);ctx.clip();
+      ctx.beginPath();ctx.moveTo(0,mid);
+      for(let px=0;px<Math.min(Math.ceil(playedX),W);px++){
+        const t=tlX2T(px);if(t<0||t>vid.duration)continue;
+        const v=wfPeaks[Math.min(Math.floor(t/vid.duration*wfPeaks.length),wfPeaks.length-1)];
+        ctx.lineTo(px,mid-Math.max(1.5,v*amp));
+      }
+      for(let px=Math.min(Math.ceil(playedX),W)-1;px>=0;px--){
+        const t=tlX2T(px);if(t<0||t>vid.duration)continue;
+        const v=wfPeaks[Math.min(Math.floor(t/vid.duration*wfPeaks.length),wfPeaks.length-1)];
+        ctx.lineTo(px,mid+Math.max(1.5,v*amp));
+      }
+      ctx.closePath();ctx.fillStyle='#4da6db';ctx.fill();
+      ctx.restore();
     }
   }
-
-  // Subtitle bars — teal inactive, orange active, white border
-  subs.forEach((s,i)=>{
-    const x1=tlT2X(s.start),x2=tlT2X(s.end);
-    if(x2<0||x1>W)return;
-    const w=Math.max(3,x2-x1),act=i===activeIdx;
-    const lx=Math.max(0,x1),rx=Math.min(W,x2),bw=rx-lx;
-    if(bw<=0)return;
-
-    // Fill
-    ctx.fillStyle=act?'#c2410c':'#0f766e';
-    ctx.globalAlpha=act?.95:.78;
-    ctx.fillRect(lx,BT,bw,BH);
-
-    // White border
-    ctx.globalAlpha=act?.9:.5;
-    ctx.strokeStyle=act?'#fed7aa':'#99f6e4';
-    ctx.lineWidth=1.5;
-    ctx.strokeRect(lx+.75,BT+.75,bw-1.5,BH-1.5);
-
-    // Resize handles
-    ctx.globalAlpha=1;
-    ctx.fillStyle=act?'#fb923c':'#2dd4bf';
-    if(x1>=0&&x1<=W)ctx.fillRect(x1,BT,4,BH);
-    if(x2>=0&&x2<=W)ctx.fillRect(x2-4,BT,4,BH);
-
-    // Label
-    if(bw>28){
-      ctx.globalAlpha=1;ctx.fillStyle='#fff';ctx.font='10px -apple-system,sans-serif';ctx.textAlign='left';
-      ctx.save();ctx.beginPath();ctx.rect(lx+6,BT,bw-12,BH);ctx.clip();
-      ctx.fillText(s.text.replace(/\n/g,' '),lx+6,BT+BH/2+3.5);ctx.restore();
-    }
-    ctx.globalAlpha=1;
-  });
 
   // Snap indicator
   if(snapIndicator!==null){
@@ -1456,7 +1745,7 @@ function renderTL(){
     }
   }
 
-  // Ruler
+  // Ruler (drawn on top of waveform)
   ctx.fillStyle='#0a0f1a';ctx.fillRect(0,0,W,RH);
   ctx.fillStyle='#1e2d3d';ctx.fillRect(0,RH,W,1);
   const vis=W/tlPPS,tick=tlTickInterval(vis),startT=Math.floor(tlOff/tick)*tick;
@@ -1465,15 +1754,6 @@ function renderTL(){
     const x=Math.round(tlT2X(t));if(x<-30||x>W+30)continue;
     ctx.fillStyle='#2d4058';ctx.fillRect(x,RH-5,1,5);
     ctx.fillStyle='#4a6785';ctx.fillText(s2hms(t),x,RH-7);
-  }
-
-  // Playhead
-  const px=Math.round(tlT2X(vid.currentTime||0));
-  if(px>=-2&&px<=W+2){
-    ctx.strokeStyle='#f85149';ctx.lineWidth=2;
-    ctx.beginPath();ctx.moveTo(px,0);ctx.lineTo(px,H);ctx.stroke();
-    ctx.fillStyle='#f85149';
-    ctx.beginPath();ctx.moveTo(px-5,0);ctx.lineTo(px+5,0);ctx.lineTo(px,9);ctx.fill();
   }
 
   // Long-press ring indicator
@@ -1489,9 +1769,14 @@ function renderTL(){
   }
 }
 
-function tlStartLoop(){if(tlRAF)return;function L(){renderTL();tlRAF=requestAnimationFrame(L);}tlRAF=requestAnimationFrame(L);}
+function tlStartLoop(){
+  if(tlRAF)return;
+  function L(){renderTL();movePh();tlRAF=requestAnimationFrame(L);}
+  tlRAF=requestAnimationFrame(L);
+}
 function tlStopLoop(){if(tlRAF){cancelAnimationFrame(tlRAF);tlRAF=null;}}
-function tlFit(){if(vid.duration){tlPPS=tlCv.width/vid.duration;tlOff=0;renderTL();tlSyncZoomBar();tlUpdateScrollBar();}}
+function tlFit(){if(vid.duration){tlPPS=tlCv.width/vid.duration;tlOff=0;tlUpdLayout();renderTL();renderRegions();tlSyncZoomBar();movePh();}}
+function tlZoomStep(d){const bar=document.getElementById('tlZoomBar');bar.value=Math.max(0,Math.min(100,+bar.value+d*8));tlZoomSlide(bar.value);}
 function tlSyncZoomBar(){
   const mn=vid.duration?tlCv.width/vid.duration:1,mx=600;
   const bar=document.getElementById('tlZoomBar'),pct=document.getElementById('tlZoomPct');
@@ -1504,12 +1789,12 @@ function tlZoomSlide(v){
   const mn=vid.duration?tlCv.width/vid.duration:1,mx=600;
   const cx=tlCv.width/2,t=tlX2T(cx);
   tlPPS=mn*Math.pow(mx/mn,v/100);
-  tlOff=t-cx/tlPPS;tlClamp();renderTL();
+  tlOff=t-cx/tlPPS;tlClamp();
+  tlUpdLayout();renderTL();renderRegions();movePh();
   document.getElementById('tlZoomPct').textContent=Math.round(tlPPS/mn*100)+'%';
-  tlUpdateScrollBar();
 }
 
-const EDGE=7,RH_=20,SNAP_PX=10,LP_MS=500;
+const SNAP_PX=10,LP_MS=500,RH_=20;
 let tlLPTimer=null,tlLPSX=0,tlLPSY=0,tlLPX=0,tlLPY=0,tlLPStart=0,tlLPRaf=null;
 
 function tlLPCancel(){
@@ -1517,13 +1802,10 @@ function tlLPCancel(){
   if(tlLPRaf){cancelAnimationFrame(tlLPRaf);tlLPRaf=null;}
   renderTL();
 }
-function tlLPTick(){
-  if(!tlLPTimer){tlLPRaf=null;return;}
-  renderTL();
-  tlLPRaf=requestAnimationFrame(tlLPTick);
-}
+function tlLPTick(){if(!tlLPTimer){tlLPRaf=null;return;}renderTL();tlLPRaf=requestAnimationFrame(tlLPTick);}
 
 function snapTime(t,excludeIdx){
+  if(!wfSnap)return t;
   let best=t,bestPixDist=SNAP_PX;
   subs.forEach((s,i)=>{
     if(i===excludeIdx)return;
@@ -1535,131 +1817,108 @@ function snapTime(t,excludeIdx){
   snapIndicator=(best!==t)?best:null;
   return best;
 }
-tlCv.addEventListener('mousedown',e=>{
+
+// wfHolder handles seek (ruler click) and long-press (empty space)
+wfHolder.addEventListener('mousedown',e=>{
+  if(e.target.classList.contains('wfg')||e.target.classList.contains('wfr'))return;
   if(e.button===1){e.preventDefault();tlPan={sx:e.clientX,so:tlOff};return;}
   if(e.button!==0)return;
-  const rc=tlCv.getBoundingClientRect(),sc=tlCv.width/rc.width;
-  const x=(e.clientX-rc.left)*sc,y=(e.clientY-rc.top)*(tlCv.height/rc.height);
+  const rc=wfHolder.getBoundingClientRect();
+  const x=e.clientX-rc.left; // canvas-local x (holder is scrolled; canvas is sticky at left:0)
+  const y=e.clientY-rc.top;
+  if(y<=RH_){vid.currentTime=Math.max(0,Math.min(tlX2T(x),vid.duration||0));renderTL();movePh();return;}
+  vid.currentTime=Math.max(0,Math.min(tlX2T(x),vid.duration||0));renderTL();movePh();
   const BT=RH_+3,BH=tlCv.height-RH_-6;
-  if(y<=RH_){vid.currentTime=Math.max(0,Math.min(tlX2T(x),vid.duration||0));renderTL();return;}
-  for(let i=subs.length-1;i>=0;i--){
-    const s=subs[i],x1=tlT2X(s.start),x2=tlT2X(s.end);
-    if(y<BT||y>BT+BH||x<x1-EDGE||x>x2+EDGE)continue;
-    push();
-    let type='move';if(x<=x1+EDGE)type='left';else if(x>=x2-EDGE)type='right';
-    tlDrag={i,type,sx:x,os:s.start,oe:s.end};
-    activeIdx=i;document.querySelectorAll('.srow').forEach((r,j)=>r.classList.toggle('act',j===i));
-    document.getElementById(`row-${i}`)?.scrollIntoView({block:'nearest'});
-    renderTL();return;
-  }
-  // Empty space: seek + start long-press timer to add subtitle
-  vid.currentTime=Math.max(0,Math.min(tlX2T(x),vid.duration||0));renderTL();
   if(y>=BT&&y<=BT+BH){
     tlLPSX=e.clientX;tlLPSY=e.clientY;tlLPX=x;tlLPY=y;tlLPStart=Date.now();
     tlLPTimer=setTimeout(()=>{
-      tlLPTimer=null;
-      if(tlLPRaf){cancelAnimationFrame(tlLPRaf);tlLPRaf=null;}
+      tlLPTimer=null;if(tlLPRaf){cancelAnimationFrame(tlLPRaf);tlLPRaf=null;}
       if(!vid.duration)return;
       const t=Math.max(0,Math.min(tlX2T(tlLPX),vid.duration));
       push();
       const ns={start:t,end:Math.min(t+2,vid.duration),text:''};
       subs.push(ns);subs.sort((a,b)=>a.start-b.start);
       const idx=subs.indexOf(ns);activeIdx=idx;
-      renderList();renderTL();tlUpdateScrollBar();
+      renderList();renderTL();renderRegions();tlUpdLayout();
       setTimeout(()=>{
-        document.getElementById(`row-${idx}`)?.scrollIntoView({block:'nearest',behavior:'smooth'});
-        const tx=document.getElementById(`tx-${idx}`);if(tx){tx.focus();tx.select();}
+        document.getElementById('row-'+idx)?.scrollIntoView({block:'nearest',behavior:'smooth'});
+        const tx=document.getElementById('tx-'+idx);if(tx){tx.focus();tx.select();}
       },50);
     },LP_MS);
     if(!tlLPRaf)tlLPRaf=requestAnimationFrame(tlLPTick);
   }
 });
+
 document.addEventListener('mousemove',e=>{
-  // Cancel long-press if mouse moved more than 5px
-  if(tlLPTimer){
-    const dx=e.clientX-tlLPSX,dy=e.clientY-tlLPSY;
-    if(dx*dx+dy*dy>25){tlLPCancel();}
+  if(tlLPTimer){const dx=e.clientX-tlLPSX,dy=e.clientY-tlLPSY;if(dx*dx+dy*dy>25)tlLPCancel();}
+  if(tlPan){
+    const dx=e.clientX-tlPan.sx;
+    tlOff=Math.max(0,tlPan.so-dx/tlPPS);tlClamp();
+    wfHolder._ign=true;wfHolder.scrollLeft=Math.round(tlOff*tlPPS);wfHolder._ign=false;
+    renderTL();renderRegions();return;
   }
-  if(tlPan){const dx=e.clientX-tlPan.sx;tlOff=tlPan.so-dx/tlPPS;tlClamp();renderTL();tlUpdateScrollBar();return;}
   if(ovDrag){
-    const vw=document.getElementById('vWrap'),rect=vw.getBoundingClientRect();
+    const rect=document.getElementById('vidFrame').getBoundingClientRect();
     const rawX=Math.max(3,Math.min(97,ovDragX0+(e.clientX-ovDragSX)/rect.width*100));
     const rawY=Math.max(3,Math.min(97,ovDragY0+(e.clientY-ovDragSY)/rect.height*100));
     const sx=_snapG(rawX,GUIDES_X,SNAP_GT);
     const sy=_snapG(rawY,GUIDES_Y,SNAP_GT);
-    st.xPct=sx.val; st.yPct=sy.val;
+    st.xPct=sx.val;st.yPct=sy.val;
     _showGuides(sx.snapped,sy.snapped);
-    updatePosReadout(); applyOvStyle();
-    return;
+    updatePosReadout();applyOvStyle();return;
   }
-  if(!tlDrag)return;
-  const rc=tlCv.getBoundingClientRect();
-  const x=(e.clientX-rc.left)*(tlCv.width/rc.width),dt=(x-tlDrag.sx)/tlPPS,s=subs[tlDrag.i],dur=tlDrag.oe-tlDrag.os;
-  snapIndicator=null;
-  if(tlDrag.type==='move'){s.start=snapTime(Math.max(0,tlDrag.os+dt),tlDrag.i);s.end=s.start+dur;}
-  else if(tlDrag.type==='left'){s.start=snapTime(Math.max(0,Math.min(tlDrag.oe-.1,tlDrag.os+dt)),tlDrag.i);}
-  else{s.end=snapTime(Math.max(s.start+.1,tlDrag.oe+dt),tlDrag.i);}
-  const si=document.getElementById(`ts-${tlDrag.i}`),ei=document.getElementById(`te-${tlDrag.i}`);
-  if(si)si.value=s2srt(s.start);if(ei)ei.value=s2srt(s.end);
-  renderTL();
+  onWfRegDrag(e);
 });
+
 document.addEventListener('mouseup',()=>{
   if(tlLPTimer)tlLPCancel();
   const wasDragging=ovDrag;
-  tlDrag=null;tlPan=null;ovDrag=false;
+  tlPan=null;ovDrag=false;
+  if(_wfRegDrag){_wfRegDrag=null;snapIndicator=null;renderRegions();renderTL();}
   if(wasDragging)_hideGuides();
   if(snapIndicator!==null){snapIndicator=null;renderTL();}
-  tlUpdateScrollBar();
+  tlUpdLayout();
 });
 
-tlCv.addEventListener('mousemove',e=>{
-  if(tlDrag||tlPan)return;
-  const rc=tlCv.getBoundingClientRect();
-  const x=(e.clientX-rc.left)*(tlCv.width/rc.width),y=(e.clientY-rc.top)*(tlCv.height/rc.height);
+wfHolder.addEventListener('mousemove',e=>{
+  if(_wfRegDrag||tlPan)return;
+  const y=e.clientY-wfHolder.getBoundingClientRect().top;
   const BT=RH_+3,BH=tlCv.height-RH_-6;
-  if(y>BT&&y<BT+BH){
-    for(let i=subs.length-1;i>=0;i--){
-      const x1=tlT2X(subs[i].start),x2=tlT2X(subs[i].end);
-      if(x>=x1-EDGE&&x<=x2+EDGE){tlCv.style.cursor=(x<=x1+EDGE||x>=x2-EDGE)?'ew-resize':'grab';return;}
-    }
-    tlCv.style.cursor='cell'; // hint: can long-press to add subtitle
-    return;
-  }
-  tlCv.style.cursor='crosshair';
+  wfHolder.style.cursor=(y>BT&&y<BT+BH)?'cell':'crosshair';
 });
 
 // ── Waveform ──────────────────────────────────────────────────────────────
 async function loadWf(){
   if(!videoId)return;
   try{
-    const r=await fetch(`/api/extract_audio/${videoId}`);
-    if(!r.ok)throw new Error(`server ${r.status}`);
+    const r=await fetch('/api/extract_audio/'+videoId);
+    if(!r.ok)throw new Error('server '+r.status);
     const ac=new(window.AudioContext||window.webkitAudioContext)();
     const decoded=await ac.decodeAudioData(await r.arrayBuffer());
     ac.close();
-    const data=decoded.getChannelData(0),N=Math.min(tlCv.width*4,10000),block=Math.max(1,Math.floor(data.length/N));
+    const data=decoded.getChannelData(0),N=8000,block=Math.max(1,Math.floor(data.length/N));
     const peaks=new Float32Array(N);let mx=0;
     for(let i=0;i<N;i++){let s=0;for(let j=0;j<block;j++)s+=Math.abs(data[i*block+j]||0);peaks[i]=s/block;if(peaks[i]>mx)mx=peaks[i];}
     if(mx>0)for(let i=0;i<N;i++)peaks[i]/=mx;
     wfPeaks=peaks;renderTL();
-  }catch(e){
-    console.warn('波形載入失敗:',e.message);
-  }
+  }catch(e){console.warn('波形載入失敗:',e.message);}
 }
 
-// ── Wheel zoom sync ───────────────────────────────────────────────────────
-tlCv.addEventListener('wheel',e=>{
+// ── Wheel zoom ────────────────────────────────────────────────────────────
+wfHolder.addEventListener('wheel',e=>{
   e.preventDefault();
-  const rc=tlCv.getBoundingClientRect(),x=(e.clientX-rc.left)*(tlCv.width/rc.width),t=tlX2T(x);
+  const rc=wfHolder.getBoundingClientRect(),x=e.clientX-rc.left,t=tlX2T(x);
   const mn=vid.duration?tlCv.width/vid.duration:.1;
   tlPPS=Math.max(mn,Math.min(600,tlPPS*(e.deltaY<0?1.25:.8)));
-  tlOff=t-x/tlPPS;tlClamp();renderTL();tlSyncZoomBar();tlUpdateScrollBar();
+  tlOff=t-x/tlPPS;tlClamp();
+  tlUpdLayout();renderTL();renderRegions();tlSyncZoomBar();movePh();
 },{passive:false});
 
 // ── Init ──────────────────────────────────────────────────────────────────
 fetch('/api/models').then(r=>r.json()).then(d=>{
   document.getElementById('mdlSel').querySelectorAll('option').forEach(o=>{if(d.cached?.includes(o.value))o.textContent+=' ✅';});
 }).catch(()=>{});
+sessionLoad();
 </script>
 </body>
 </html>
