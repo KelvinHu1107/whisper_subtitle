@@ -228,26 +228,36 @@ def _burn_worker(bid,vpath,ass_path,out_path,crf):
         job["status"]="running"; job["progress"]=5
         dur=get_duration(vpath)
         acodec=_probe_audio_codec(vpath)
-        a_opts=["-c:a","copy"] if acodec in _MP4_SAFE_AUDIO else ["-c:a","aac","-b:a","256k"]
-        cmd=["ffmpeg","-y","-i",vpath,"-vf",f"ass={ass_path}",
-             "-c:v","libx264","-crf",str(crf),"-preset","fast","-pix_fmt","yuv420p",
+        if not acodec:
+            a_opts=["-an"]  # no audio stream in source
+        elif acodec in _MP4_SAFE_AUDIO:
+            a_opts=["-c:a","copy"]
+        else:
+            a_opts=["-c:a","aac","-b:a","256k"]
+        # format=yuv420p BEFORE ass= ensures 8-bit input for the filter,
+        # which is required for 10-bit HEVC sources (yuv420p10le etc.)
+        cmd=["ffmpeg","-y","-i",vpath,
+             "-vf",f"format=yuv420p,ass={ass_path}",
+             "-c:v","libx264","-crf",str(crf),"-preset","fast",
              *a_opts,out_path]
         proc=subprocess.Popen(cmd,stderr=subprocess.PIPE,stdout=subprocess.DEVNULL,universal_newlines=True)
         tre=re.compile(r"time=(\d+):(\d+):(\d+\.\d+)")
+        _ansi=re.compile(r'\x1b\[[0-9;]*[mGKHF]')
         err_lines=[]
         for line in proc.stderr:
             if job.get("cancel"): proc.kill(); job["status"]="cancelled"; return
-            err_lines.append(line.rstrip())
+            err_lines.append(_ansi.sub('',line.rstrip()))
             m=tre.search(line)
             if m and dur>0:
                 t=float(m.group(1))*3600+float(m.group(2))*60+float(m.group(3))
                 job["progress"]=min(95,int(t/dur*100))
         proc.wait()
+        job["log"]="\n".join(err_lines[-60:])
         if proc.returncode!=0:
             detail=next((l for l in reversed(err_lines) if any(k in l for k in ('Error','error','Invalid','No such','Unknown','not found','Unrecognized'))),'')
             job["status"]="error"; job["error"]=f"ffmpeg 失敗（code {proc.returncode}）{': '+detail if detail else ''}"
         else: job["progress"]=100; job["status"]="done"; job["out"]=out_path
-    except Exception as e: job["status"]="error"; job["error"]=str(e)
+    except Exception as e: job["status"]="error"; job["error"]=str(e); job["log"]=str(e)
 
 # ── Flask ─────────────────────────────────────────────────────────────────
 app=Flask(__name__)
@@ -313,7 +323,7 @@ def api_burn_start():
     out_path=str(UPLOAD_DIR/f"{bid}_out.mp4")
     with open(ass_path,"w",encoding="utf-8") as f: f.write(_build_ass(d.get("segments",[]),d.get("style",{})))
     orig_name=VIDEO_NAMES.get(d.get('video_id',''),'subtitled')
-    BURN_JOBS[bid]={"status":"pending","progress":0,"out":None,"error":None,"cancel":False,"orig_name":orig_name}
+    BURN_JOBS[bid]={"status":"pending","progress":0,"out":None,"error":None,"cancel":False,"orig_name":orig_name,"log":""}
     threading.Thread(target=_burn_worker,daemon=True,
         args=(bid,str(matches[0]),ass_path,out_path,int(d.get("crf",18)))).start()
     return jsonify({"burn_id":bid})
@@ -322,7 +332,7 @@ def api_burn_start():
 def api_burn_job(bid):
     j=BURN_JOBS.get(bid)
     if not j: return jsonify({"status":"not_found"}),404
-    return jsonify({"status":j["status"],"progress":j["progress"],"error":j["error"]})
+    return jsonify({"status":j["status"],"progress":j["progress"],"error":j["error"],"log":j.get("log","")})
 
 @app.route("/api/extract_audio/<vid_id>")
 def api_extract_audio(vid_id):
@@ -965,6 +975,13 @@ video{max-width:100%;max-height:62vh;display:block;border-radius:16px}
         <option value="23">一般品質（CRF 23）</option>
       </select>
     </div>
+    <div id="burnErrBox" style="display:none;margin-top:10px;border:1px solid rgba(248,81,73,.4);border-radius:8px;padding:10px 12px;background:rgba(248,81,73,.06)">
+      <div id="burnErrMsg" style="font-size:12px;color:var(--red);font-weight:700;margin-bottom:6px"></div>
+      <details>
+        <summary style="font-size:11px;color:var(--mut);cursor:pointer;user-select:none">查看 FFmpeg 錯誤記錄 ▸</summary>
+        <pre id="burnErrPre" style="margin-top:7px;max-height:180px;overflow-y:auto;background:var(--bg);border:1px solid var(--bd);border-radius:5px;padding:8px;font-size:10px;color:var(--mut);white-space:pre-wrap;word-break:break-all;font-family:'SF Mono','Fira Code',monospace;line-height:1.5"></pre>
+      </details>
+    </div>
     <div class="mbtns">
       <button onclick="closeBurn()">取消</button>
       <button class="pri" id="btnBurn" onclick="startBurn()">🎬 開始燒錄</button>
@@ -1436,6 +1453,7 @@ let burnId=null,burnPoll=null;
 function openBurn(){
   if(!videoId){alert('請先上傳影片');return;}
   if(!subs.length){alert('沒有字幕');return;}
+  document.getElementById('burnErrBox').style.display='none';
   document.getElementById('burnM').classList.add('open');
   document.getElementById('btnBurn').disabled=false;
   document.getElementById('btnBurn').textContent='🎬 開始燒錄';
@@ -1461,7 +1479,16 @@ function pollBurn(){
     updateLoading(d.progress||0,`燒錄中… ${d.progress||0}%`);
     if(d.status==='done'){hideLoading();sessionClear();window.location.href=`/api/burn_download/${burnId}`;burnId=null;}
     else if(d.status==='cancelled'){hideLoading();burnId=null;}
-    else if(d.status==='error'){hideLoading();alert('燒錄失敗：'+(d.error||'未知錯誤'));burnId=null;}
+    else if(d.status==='error'){
+      hideLoading();
+      document.getElementById('burnErrMsg').textContent='燒錄失敗：'+(d.error||'未知錯誤');
+      document.getElementById('burnErrPre').textContent=d.log||'（無詳細記錄）';
+      document.getElementById('burnErrBox').style.display='';
+      document.getElementById('burnM').classList.add('open');
+      document.getElementById('btnBurn').disabled=false;
+      document.getElementById('btnBurn').textContent='🔄 重新燒錄';
+      burnId=null;
+    }
     else burnPoll=setTimeout(pollBurn,1000);
   }).catch(()=>{burnPoll=setTimeout(pollBurn,2000);});
 }
